@@ -192,3 +192,30 @@ def test_golden_chip_matches_trained_net():
     got = torch_rasters(SpikeMeshNet.from_netir(net), x)
     for i in range(len(x)):
         assert_rasters_equal(run_on_chip(net, x[i], 256), [g[i] for g in got])
+
+
+@pytest.mark.skipif(not (Path(__file__).resolve().parents[2] / "data" / "mnist").exists(),
+                    reason="MNIST not downloaded (python -m train.data)")
+def test_tiny_training_run_exports_bit_exact(tmp_path):
+    """End to end: train.main (float + QAT epoch) -> best.pt + net.npz; the trained
+    model itself (max-abs scaling path, not from_netir) == reference_run on 200 samples."""
+    from train.data import emulated_nmnist
+    from train.train import main
+    log = main(["--limit", "1500", "--val", "200", "--epochs", "3", "--float-epochs", "1",
+                "--test-limit", "200", "--bs", "32", "--lr", "5e-3", "--leak", "2", "--count-gain", "0.3",
+                "--hidden", "64", "--threads", "2", "--out", str(tmp_path)])
+    ck = torch.load(tmp_path / "best.pt")
+    c = ck["config"]
+    n = len(c["sizes"]) - 1
+    m = SpikeMeshNet(c["sizes"], c["leak_shift"], c["reset_mode"], c["refrac"], [None] * n)
+    m.load_state_dict(ck["state"])
+    net = NetIR.load(tmp_path / "net.npz")
+    x, y = emulated_nmnist("test", limit=200)
+    got = torch_rasters(m, x)
+    correct = 0
+    for i in range(len(x)):
+        ref = reference_run(net, x[i])
+        assert_rasters_equal([g[i] for g in got], ref)
+        correct += ref[-1].sum(0).argmax() == y[i]
+    assert correct / len(x) > 0.4          # learned something (chance = 0.1)
+    assert abs(log["test_int"] - net.meta["test_acc_int"]) < 1e-12

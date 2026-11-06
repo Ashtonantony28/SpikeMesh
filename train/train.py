@@ -57,6 +57,7 @@ def main(argv=None):
     ap.add_argument("--count-gain", type=float, default=0.5)
     ap.add_argument("--mem-weight", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=None, help="use only N training samples (smoke tests)")
+    ap.add_argument("--test-limit", type=int, default=None, help="evaluate on the first N test samples only")
     ap.add_argument("--val", type=int, default=5000, help="hold out last N train samples for model selection")
     ap.add_argument("--max-minutes", type=float, default=25.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -80,6 +81,8 @@ def main(argv=None):
         xte, yte = emulated_nmnist("test", a.T, a.d, a.thr)
         dataset = f"emulated N-MNIST (MNIST saccade emulation, not real N-MNIST) T={a.T} d={a.d} thr={a.thr}"
     n_classes = int(max(ytr.max(), yte.max())) + 1
+    if a.test_limit:
+        xte, yte = xte[:a.test_limit], yte[:a.test_limit]
     xva, yva = xtr[-a.val:], ytr[-a.val:]
     xtr, ytr = xtr[:-a.val], ytr[:-a.val]
     if a.limit:
@@ -126,7 +129,8 @@ def main(argv=None):
             best = va_i
             torch.save({"state": model.state_dict(), "config": model.config(), "args": vars(a)},
                        out / "best.pt")
-        if (time.time() - t0) / 60 > a.max_minutes:
+        elapsed = (time.time() - t0) / 60
+        if elapsed * (ep + 2) / (ep + 1) > a.max_minutes:  # next epoch would overrun
             print("time budget reached, stopping")
             break
 
