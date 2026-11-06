@@ -12,7 +12,7 @@ All arithmetic is integer. "sat16(x)" clamps to [-32768, 32767]; "sat8(x)" clamp
 | `N_NEURONS` | 256 | Neurons per core (power of two, ≤ 1024). |
 | `N_AXONS` | 256 | Input axons per core (power of two, ≤ 1024). |
 | `W_BITS` | 8 | Weight width, signed. 8 or 4. |
-| `FANOUT_DEPTH` | 1024 | Entries in a core's fan-out memory. |
+| `FANOUT_DEPTH` | 1024 | Entries in a core's fan-out memory (max 1024: the pointer base is 10 bits). |
 
 ## 2. Neuron model (ADR-001)
 
@@ -83,7 +83,7 @@ Flits are 48 bits, single-flit packets.
 | Type | Payload |
 |---|---|
 | SPIKE (to core) | `[37]` parity, `[9:0]` axon id |
-| SPIKE (to host, dest_x = 15) | `[37]` parity, `[29:26]` src_x, `[25:22]` src_y, `[9:0]` neuron id |
+| SPIKE (to host, dest_x = 15, dest_y = 0) | `[37]` parity, `[29:26]` src_x, `[25:22]` src_y, `[9:0]` neuron id |
 | CFG_WRITE | `[37:16]` address (22 bits, §5), `[15:0]` data |
 | READ_REQ | `[37]` = 0, `[36:15]` address, `[14:11]` reply_x, `[10:7]` reply_y |
 | READ_RESP | `[37]` = 1, `[31:16]` low 16 bits of address, `[15:0]` data |
@@ -103,6 +103,10 @@ Routing: dimension-order XY (route X first, then Y). Host port is the west side 
 | Core regs | 11 | `[7:0]` = register | see below |
 
 Core registers: 0 `theta`, 1 `leak_shift`, 2 `reset_mode`, 3 `refrac`, 4 `v_min`, 8 `learn_en`, 9 `stdp_a_plus`, 10 `stdp_a_minus`, 11 `stdp_shift`, 12 `tau_pre_shift`, 13 `tau_post_shift`, 14 `inc_pre`, 15 `inc_post`, 16 `lfsr_seed`, 17 `w_min`, 18 `w_max`, 19 `rstdp_en`, 20 `tau_elig_shift`, 21 `reward_shift`. Unused bits read as zero.
+
+Weight writes ignore data bits above `W_BITS` (the compiler writes them as zero).
+
+Reset values: only control state (FSMs, accumulator banks, learning flags and traces, LFSR, core registers) is reset by `rst_n`. Weights, neuron `v`/`bias`/`refc`, fan-out pointers and fan-out entries are memories with undefined contents after reset; the host must write every location it relies on, including fan-out pointer = 0 for unused neurons. (The golden model starts them at zero.)
 
 A neuron with fan-out count 0 sends nothing. A neuron's fan-out entries are `base .. base + count - 1`, sent in ascending order.
 
