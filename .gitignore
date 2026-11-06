@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+sim_build/
+results.xml
+*.vcd
+*.fst
+obj_dir/
+data/
+runs/
+.pytest_cache/
