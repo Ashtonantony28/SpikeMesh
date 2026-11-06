@@ -1,4 +1,7 @@
-// SpikeMesh neurocore (SG2: inference). Contract: docs/SPEC.md §2-§5, §8.
+// SpikeMesh neurocore. Contract: docs/SPEC.md §2-§6, §8.
+// LEARN = 0: inference only (no learning hardware). LEARN = 1: STDP
+// (learn_engine.sv; rstdp_en is ignored). LEARN = 2: STDP + R-STDP
+// (adds the int16 eligibility memory).
 //
 // See rtl/core/README.md for the microarchitecture. Summary:
 //   * Input engine: one flit at a time. SPIKE = read one weight row
@@ -26,7 +29,8 @@ module neurocore #(
     parameter integer LANES          = 8,
     // SPEC §2: W_BITS + log2(N_AXONS) + 1. Exact as long as no axon gets more
     // than two spikes in one timestep; override for heavier fan-in.
-    parameter integer ACC_W          = W_BITS + $clog2(N_AXONS) + 1
+    parameter integer ACC_W          = W_BITS + $clog2(N_AXONS) + 1,
+    parameter integer LEARN          = 0
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -99,7 +103,9 @@ module neurocore #(
     reg        [3:0]  r_refrac;
     reg signed [15:0] r_vmin;
     reg        [15:0] r_lreg [0:13];   // registers 8..21
-    wire              learn_en = (r_lreg[0] != 16'd0);
+    wire              learn_en = (LEARN != 0) && (r_lreg[0] != 16'd0);
+    wire              rstdp_en = (LEARN == 2) && (r_lreg[19-8] != 16'd0);
+    reg               r_dbg_elig;      // reg 22 (LEARN == 2): region 00 addresses e[a][n]
 
     // 32-bit index temporaries below are sliced; their upper bits are unused.
     /* verilator lint_off UNUSEDSIGNAL */
@@ -136,13 +142,28 @@ module neurocore #(
     wire [FAW-1:0] d_f     = d_f32[FAW-1:0];
     wire          d_word   = dec_addr[0];
     wire [7:0]    d_reg    = dec_addr[7:0];
+    wire [3:0]    d_sub    = dec_addr[19:16];   // region 11 sub-space (debug, LEARN > 0)
+    // learning debug access: region 11 sub 1..4, or region 00 with reg 22 set
+    wire          d_ldbg   = (LEARN != 0) &&
+                             (((d_region == 2'd3) && (d_sub >= 4'd1) && (d_sub <= 4'd4)) ||
+                              ((d_region == 2'd0) && r_dbg_elig));
+    wire [2:0]    d_ldsel  = (d_region == 2'd0) ? 3'd0 : d_sub[2:0];
 
     /* verilator lint_on UNUSEDSIGNAL */
     // core register read mux (combinational, indexed by the incoming flit)
     reg [15:0] d_regval;
+    wire [15:0] le_lfsr;
+    reg signed [31:0] reward_acc;  // summed CTRL REWARD values
     always @* begin
         d_regval = 16'd0;
-        case (d_reg)
+        if (d_sub == 4'd5) begin
+            if (LEARN != 0) case (dec_addr[1:0])
+                2'd0: d_regval = le_lfsr;
+                2'd1: d_regval = reward_acc[15:0];
+                2'd2: d_regval = reward_acc[31:16];
+                default: d_regval = 16'd0;
+            endcase
+        end else if (d_sub == 4'd0) case (d_reg)
             8'd0: d_regval = r_theta;
             8'd1: d_regval = {12'd0, r_leak};
             8'd2: d_regval = {15'd0, r_reset_mode};
@@ -150,6 +171,7 @@ module neurocore #(
             8'd4: d_regval = r_vmin;
             default:
                 if (d_reg >= 8'd8 && d_reg <= 8'd21) d_regval = r_lreg[4'(d_reg - 8'd8)];
+                else if (d_reg == 8'd22) d_regval = {15'd0, r_dbg_elig};
         endcase
     end
 
@@ -224,10 +246,12 @@ module neurocore #(
     reg [LBW-1:0] rd_lane;
     reg [15:0]    rd_addr16, rd_regval;
     reg [3:0]     rd_rx, rd_ry;
+    reg           rd_dbg;
     reg [47:0]    rd_resp;
-    // learning placeholder / reward
-    reg           learn_busy;
-    reg signed [31:0] reward_acc;  // summed CTRL REWARD values (SG6 consumes)
+    // learning
+    reg           learn_pending;
+    wire          le_busy;
+    wire          learn_hold = learn_pending | le_busy;
     // update
     reg           upd_pending, upd_active, upd_par;
     reg [NB:0]    r_n;
@@ -255,7 +279,7 @@ module neurocore #(
     // Input handshake
     // ------------------------------------------------------------------
     wire upd_hold = upd_pending | upd_active;
-    assign in_ready = !init_busy && (st == S_IDLE) && !learn_busy &&
+    assign in_ready = !init_busy && (st == S_IDLE) && !learn_hold &&
                       (!upd_hold || is_ctrl || (is_spike && (in_par != upd_par)));
     wire accept  = in_valid && in_ready;
     wire acc_spk = accept && is_spike;
@@ -286,7 +310,7 @@ module neurocore #(
     // ------------------------------------------------------------------
     // Update engine: stage R (issue) / stage C (compute + write back)
     // ------------------------------------------------------------------
-    wire upd_can_start = upd_pending && !upd_active && !learn_busy &&
+    wire upd_can_start = upd_pending && !upd_active && !learn_hold &&
                          ((st == S_IDLE) || ((st == S_SPK) && (spk_bank != upd_par))) &&
                          !(s2_valid && (s2_bank == upd_par));
     wire u_issue = upd_active && !r_done && (sf_cnt <= 3'(SF_DEPTH - 2));
@@ -324,13 +348,46 @@ module neurocore #(
     wire [5:0]              c_cnt    = p_rdata[15:10];
     wire                    sf_push  = c_valid && c_fire && (c_cnt != 6'd0);
 
-    // Learning hooks for SG6 (pre/post spike events). Not consumed yet.
-    /* verilator lint_off UNUSEDSIGNAL */
-    wire           hook_pre_valid   = acc_spk && learn_en;
-    wire [AB-1:0]  hook_pre_axon    = in_axon;
-    wire           hook_post_valid  = c_valid && c_fire && learn_en;
-    wire [NB-1:0]  hook_post_neuron = c_n;
-    /* verilator lint_on UNUSEDSIGNAL */
+    // ------------------------------------------------------------------
+    // Learning engine (SPEC §6)
+    // ------------------------------------------------------------------
+    // LEARN starts once no spike is mid-accumulation and UPDATE is idle.
+    wire learn_go = learn_pending && (st == S_IDLE) && !s2_valid && !upd_hold;
+    wire          le_w_re, le_w_we, le_reward_clr;
+    wire [WAW-1:0] le_w_raddr, le_w_waddr;
+    wire [LANES-1:0] le_w_wmask;
+    wire [WROW-1:0] le_w_wdata;
+    wire [15:0]   le_dbg_rdata;
+    wire          ld_we = acc_cfg && d_ldbg;
+    wire          ld_re = acc_rd && d_ldbg;
+    generate
+        if (LEARN != 0) begin : g_learn
+            learn_engine #(.N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS), .W_BITS(W_BITS),
+                           .LANES(LANES), .RSTDP(LEARN == 2 ? 1 : 0)) u_learn (
+                .clk(clk), .rst_n(rst_n), .start(learn_go && learn_en), .busy(le_busy),
+                .a_plus(r_lreg[9-8]), .a_minus(r_lreg[10-8]), .stdp_shift(r_lreg[11-8]),
+                .tau_pre(r_lreg[12-8]), .tau_post(r_lreg[13-8]), .inc_pre(r_lreg[14-8]),
+                .inc_post(r_lreg[15-8]), .w_min(r_lreg[17-8]), .w_max(r_lreg[18-8]),
+                .rstdp_en(rstdp_en), .tau_elig(r_lreg[20-8]), .reward_shift(r_lreg[21-8]),
+                .lfsr_load(acc_cfg && (d_region == 2'd3) && (d_sub == 4'd0) && (d_reg == 8'd16)),
+                .lfsr_seed(cfg_data), .lfsr(le_lfsr),
+                .reward(reward_acc), .reward_clr(le_reward_clr),
+                .pre_set(acc_spk && learn_en), .pre_axon(in_axon),
+                .post_wr(c_valid && learn_en), .post_n(c_n), .post_fire(c_fire),
+                .w_re(le_w_re), .w_raddr(le_w_raddr), .w_rdata(w_rdata),
+                .w_we(le_w_we), .w_wmask(le_w_wmask), .w_waddr(le_w_waddr), .w_wdata(le_w_wdata),
+                .dbg_we(ld_we), .dbg_re(ld_re), .dbg_sel(d_ldsel), .dbg_idx((d_region == 2'd0) ? dec_addr[19:0] : {4'd0, dec_addr[15:0]}),
+                .dbg_wdata(cfg_data), .dbg_rdata(le_dbg_rdata));
+        end else begin : g_nolearn
+            assign le_busy = 1'b0; assign le_w_re = 1'b0; assign le_w_we = 1'b0;
+            assign le_reward_clr = 1'b0; assign le_w_raddr = '0; assign le_w_waddr = '0;
+            assign le_w_wmask = '0; assign le_w_wdata = '0; assign le_dbg_rdata = 16'd0;
+            assign le_lfsr = 16'd0;
+            /* verilator lint_off UNUSEDSIGNAL */
+            wire unused_nl = learn_en | rstdp_en | ld_we | ld_re | (|d_ldsel);
+            /* verilator lint_on UNUSEDSIGNAL */
+        end
+    endgenerate
 
     // emitter
     wire       sf_empty = (sf_cnt == 3'd0);
@@ -361,7 +418,7 @@ module neurocore #(
 
     wire upd_finish = upd_active && r_done && !c_valid && sf_empty && !e_active && !e_d_valid;
 
-    assign busy = init_busy | (st != S_IDLE) | s2_valid | learn_busy | learn_start |
+    assign busy = init_busy | (st != S_IDLE) | s2_valid | learn_hold | learn_start |
                   update_start | upd_pending | upd_active | out_valid;
 
     // ------------------------------------------------------------------
@@ -369,13 +426,22 @@ module neurocore #(
     // ------------------------------------------------------------------
     integer bi;
     always @* begin
-        // weights: CFG write; read for spike rows or READ_REQ
-        w_we    = acc_cfg && (d_region == 2'd0) && d_w_ok;
-        w_wmask = {{(LANES-1){1'b0}}, 1'b1} << d_w_lane;
-        w_waddr = d_w_addr;
-        w_wdata = {LANES{cfg_data[W_BITS-1:0]}};
-        w_re    = spk_issue || (acc_rd && (d_region == 2'd0));
-        w_raddr = spk_issue ? spk_waddr : d_w_addr;
+        // weights: CFG write / learning write; read for spike rows, READ_REQ, learning
+        if (le_busy) begin
+            w_we    = le_w_we;
+            w_wmask = le_w_wmask;
+            w_waddr = le_w_waddr;
+            w_wdata = le_w_wdata;
+            w_re    = le_w_re;
+            w_raddr = le_w_raddr;
+        end else begin
+            w_we    = acc_cfg && (d_region == 2'd0) && d_w_ok && !d_ldbg;
+            w_wmask = {{(LANES-1){1'b0}}, 1'b1} << d_w_lane;
+            w_waddr = d_w_addr;
+            w_wdata = {LANES{cfg_data[W_BITS-1:0]}};
+            w_re    = spk_issue || (acc_rd && (d_region == 2'd0) && !d_ldbg);
+            w_raddr = spk_issue ? spk_waddr : d_w_addr;
+        end
 
         // accumulator banks
         for (bi = 0; bi < 2; bi = bi + 1) begin
@@ -431,7 +497,8 @@ module neurocore #(
     wire [W_BITS-1:0] rd_w = w_rdata[rd_lane*W_BITS +: W_BITS];
     always @* begin
         rd_data = 16'd0;
-        case (rd_region)
+        if (rd_dbg) rd_data = le_dbg_rdata;
+        else case (rd_region)
             2'd0: if (rd_ok) rd_data = {{(16-W_BITS){rd_w[W_BITS-1]}}, rd_w};
             2'd1: if (rd_ok) case (rd_field)
                       2'd0: rd_data = v_rdata;
@@ -458,8 +525,9 @@ module neurocore #(
             s2_bank     <= 1'b0;
             s2_g        <= '0;
             s2_fwd      <= 1'b0;
-            learn_busy  <= 1'b0;
+            learn_pending <= 1'b0;
             reward_acc  <= 32'sd0;
+            r_dbg_elig  <= 1'b0;
             upd_pending <= 1'b0;
             upd_active  <= 1'b0;
             upd_par     <= 1'b0;
@@ -502,11 +570,12 @@ module neurocore #(
                                      (d_region == 2'd2) ? d_f_ok : 1'b1;
                         rd_addr16 <= dec_addr[15:0];
                         rd_regval <= d_regval;
+                        rd_dbg    <= d_ldbg;
                         rd_rx     <= in_flit[14:11];
                         rd_ry     <= in_flit[10:7];
                         st        <= S_RDW;
                     end
-                    if (acc_cfg && (d_region == 2'd3)) begin
+                    if (acc_cfg && (d_region == 2'd3) && (d_sub == 4'd0)) begin
                         case (d_reg)
                             8'd0: r_theta      <= cfg_data;
                             8'd1: r_leak       <= cfg_data[3:0];
@@ -516,10 +585,10 @@ module neurocore #(
                             default:
                                 if (d_reg >= 8'd8 && d_reg <= 8'd21)
                                     r_lreg[4'(d_reg - 8'd8)] <= cfg_data;
+                                else if (d_reg == 8'd22 && LEARN == 2)
+                                    r_dbg_elig <= cfg_data[0];
                         endcase
                     end
-                    if (accept && is_ctrl && (in_flit[7:0] == 8'h01))
-                        reward_acc <= reward_acc + {{16{in_flit[23]}}, in_flit[23:8]};
                 end
                 S_SPK: begin
                     spk_g <= spk_g + 1'b1;
@@ -542,10 +611,17 @@ module neurocore #(
             s2_fwd      <= spk_issue && s2_valid && (s2_bank == spk_issue_bank) && (s2_g == spk_issue_g);
             s2_fwd_data <= s2_sum;
 
-            // ---------------- learn (placeholder, SG6) ----------------
-            // learn_en = 0: nothing to do. learn_en = 1: the SG6 engine hooks
-            // in here; for now LEARN is a 1-cycle no-op.
-            learn_busy <= learn_start;
+            // CTRL REWARD (accepted in any state where in_ready is high)
+            if (le_reward_clr)
+                reward_acc <= 32'sd0;
+            else if (accept && is_ctrl && (in_flit[7:0] == 8'h01))
+                reward_acc <= reward_acc + {{16{in_flit[23]}}, in_flit[23:8]};
+
+            // ---------------- learn ----------------
+            // learn_start latches a request; LEARN runs when the input engine
+            // is idle (with learn_en = 0 it completes immediately).
+            if (learn_start && !learn_hold) learn_pending <= 1'b1;
+            if (learn_go) learn_pending <= 1'b0;
 
             // ---------------- update engine ----------------
             if (update_start && !upd_hold) begin

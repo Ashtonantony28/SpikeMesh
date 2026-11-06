@@ -29,6 +29,7 @@ STEPS = int(os.environ.get("STEPS", 12))
 MODE = os.environ.get("MODE", "mixed")
 BP = float(os.environ.get("BP", 0.3))          # out_ready low probability
 IN_GAP = float(os.environ.get("IN_GAP", 0.1))  # in_valid gap probability
+LEARN = int(os.environ.get("LEARN", 0))        # RTL build parameter
 G = N // LANES
 WMIN, WMAX = -(1 << (W - 1)), (1 << (W - 1)) - 1
 
@@ -202,3 +203,96 @@ def check_coverage(mode=MODE):
         assert COV["leak_neg_v"] > 0 and COV["v_min_clamp"] > 0, COV
     if mode == "refrac":
         assert COV["refractory"] > 0, COV
+
+
+# ---------------------------------------------------------------------------
+# Learning (SPEC §6) helpers. Debug address map (proposed; region 11):
+#   [19:16] = 1 x_pre[a], 2 x_post[n] (R/W, uint8), 3 pre_flag[a], 4 post_flag[n] (R),
+#   5: [1:0] = 0 LFSR state, 1 reward sum [15:0], 2 reward sum [31:16] (R).
+#   reg 22 bit 0 (LEARN = 2): region 00 reads/writes address e[a][n] instead of w.
+# ---------------------------------------------------------------------------
+DBG_XPRE, DBG_XPOST, DBG_PREF, DBG_POSTF, DBG_MISC = 1, 2, 3, 4, 5
+REG_DBG_ELIG = 22
+
+
+def dbg_addr(sub, idx):
+    return 3 << 20 | sub << 16 | idx
+
+
+def learn_config(rng, g: Core, mode):
+    """Learning registers + random initial traces / eligibility.
+
+    Returns (shuffle-safe flits, ordered flits). Golden is updated to match
+    (traces and eligibility directly, since golden has no address for them)."""
+    rst = mode.startswith("rstdp")
+    ext = mode.endswith("ext")
+    s0 = mode.endswith("s0")
+    bigshift = mode.endswith("bigshift")      # stdp_shift >= 24 (beyond the 24-bit product)
+    lo = rng.choice([WMIN, rng.randint(WMIN, 0)])
+    hi = rng.choice([WMAX, rng.randint(0, WMAX)])
+    if rng.random() < 0.2:          # w_min > w_max: clamp gives w_max (numpy order)
+        lo, hi = rng.randint(1, WMAX), rng.randint(WMIN, 0)
+    big = lambda: rng.choice([rng.randint(0, 0xFFFF), 0xFFFF, rng.randint(0, 4000)])
+    regs = {
+        8: rng.choice([1, rng.randint(1, 0xFFFF)]),
+        9: big() if ext else rng.randint(0, 24),
+        10: big() if ext else rng.randint(0, 24),
+        # stdp_shift <= 63: golden's mask overflows int64 beyond that
+        11: rng.choice([24, 25, 32, 40, 63]) if bigshift else 0 if s0 else (rng.choice([20, 23, 24, 25, 31, 32, 40, 63, rng.randint(9, 30)]) if ext
+                          else rng.randint(1, 8)),
+        12: rng.choice([0, 0, 1, 2, 3, rng.randint(0, 9), 0xFFFF if ext else 4]),
+        13: rng.choice([0, 0, 1, 2, 3, rng.randint(0, 9), 0xFFFF if ext else 4]),
+        14: big() if ext else rng.randint(0, 80),
+        15: big() if ext else rng.randint(0, 80),
+        16: rng.choice([0, 1, rng.randint(0, 0xFFFF)]),
+        17: lo & 0xFFFF,
+        18: hi & 0xFFFF,
+        19: rng.randint(1, 0xFFFF) if rst else 0,
+        20: rng.choice([0, 1, 2, 3, rng.randint(0, 16), 0xFFFF if ext else 5]),
+        21: (rng.choice([64, 100, 0x8023]) if bigshift else
+             rng.choice([rng.randint(0, 12), 0xFFFF, 40, 47, 64, 100]) if ext else rng.randint(0, 12)),
+    }
+    fl = [cfg(g, flits.addr_reg(r), v) for r, v in regs.items()]
+    ordered = []
+    for a in range(A):
+        x = rng.choice([0, rng.randint(0, 255), 255])
+        g.x_pre[a] = x
+        ordered.append(flits.cfg_write(CX, CY, dbg_addr(DBG_XPRE, a), x | rng.randint(0, 255) << 8))
+    for n in range(N):
+        x = rng.choice([0, rng.randint(0, 255), 255])
+        g.x_post[n] = x
+        ordered.append(flits.cfg_write(CX, CY, dbg_addr(DBG_XPOST, n), x))
+    if LEARN == 2:
+        ordered.append(flits.cfg_write(CX, CY, flits.addr_reg(REG_DBG_ELIG), 1))
+        for a in range(A):
+            for n in range(N):
+                e = rng.choice([0, rng.randint(-300, 300), rng.randint(-32768, 32767)]) if rst else 0
+                g.elig[a, n] = e
+                ordered.append(flits.cfg_write(CX, CY, flits.addr_weight(a, n, N), e & 0xFFFF))
+        ordered.append(flits.cfg_write(CX, CY, flits.addr_reg(REG_DBG_ELIG), 0))
+    return fl, ordered
+
+
+def learn_light_addrs():
+    addrs = [dbg_addr(DBG_XPRE, a) for a in range(A)] + [dbg_addr(DBG_XPOST, n) for n in range(N)]
+    addrs += [dbg_addr(DBG_PREF, a) for a in range(A)] + [dbg_addr(DBG_POSTF, n) for n in range(N)]
+    addrs += [dbg_addr(DBG_MISC, i) for i in range(3)]
+    return addrs
+
+
+def learn_expected(g: Core, addr, pending_pre=frozenset()):
+    """Expected read data for a learning debug address (golden has none)."""
+    region, sub, idx = addr >> 20 & 3, addr >> 16 & 0xF, addr & 0xFFFF
+    if region != 3 or sub == 0:
+        return g.cfg_read(addr)
+    if sub == DBG_XPRE:
+        return int(g.x_pre[idx])
+    if sub == DBG_XPOST:
+        return int(g.x_post[idx])
+    if sub == DBG_PREF:
+        return int(bool(g.pre_flag[idx]) or idx in pending_pre)
+    if sub == DBG_POSTF:
+        return int(g.post_flag[idx])
+    if sub == DBG_MISC:
+        return [g.lfsr.state, g.pending_reward & 0xFFFF, (g.pending_reward >> 16) & 0xFFFF][idx & 3]
+    raise ValueError(hex(addr))

@@ -13,7 +13,7 @@ import pytest
 from cocotb_tools.runner import get_runner
 
 ROOT = Path(__file__).resolve().parents[2]
-RTL = [ROOT / "rtl/core/sram_1r1w.sv", ROOT / "rtl/core/neurocore.sv"]
+RTL = [ROOT / "rtl/core/sram_1r1w.sv", ROOT / "rtl/core/learn_engine.sv", ROOT / "rtl/core/neurocore.sv"]
 BUILD = ROOT / "tests/core/sim_build"
 
 CONFIGS = {
@@ -22,6 +22,14 @@ CONFIGS = {
     "g1": dict(N=16, A=16, LANES=16, W=8, FD=32),     # one group per row: forwarding path
     "l1": dict(N=16, A=32, LANES=1, W=8, FD=32),      # one neuron per cycle
     "big": dict(N=256, A=256, LANES=8, W=8, FD=1024),
+    # learning builds (LEARN=2: STDP + R-STDP, LEARN=1: STDP only)
+    "small_l2": dict(N=32, A=32, LANES=4, W=8, FD=64, LEARN=2),
+    "small_l1": dict(N=32, A=32, LANES=4, W=8, FD=64, LEARN=1),
+    "w4_l2": dict(N=32, A=32, LANES=8, W=4, FD=64, LEARN=2),
+    "g1_l2": dict(N=16, A=16, LANES=16, W=8, FD=32, LEARN=2),
+    "l1_l2": dict(N=16, A=32, LANES=1, W=8, FD=32, LEARN=2),
+    "rect_l2": dict(N=64, A=16, LANES=2, W=8, FD=128, LEARN=2),
+    "big_l2": dict(N=256, A=256, LANES=8, W=8, FD=1024, LEARN=2),
 }
 X, Y = 2, 1
 _runners: dict = {}
@@ -34,12 +42,13 @@ def _run(sim, cfg_name, testcase, **env):
     if runner is None:
         runner = get_runner(sim)
         params = dict(X=X, Y=Y, N_NEURONS=c["N"], N_AXONS=c["A"], W_BITS=c["W"],
-                      FANOUT_DEPTH=c["FD"], LANES=c["LANES"])
+                      FANOUT_DEPTH=c["FD"], LANES=c["LANES"], LEARN=c.get("LEARN", 0))
         build_args = ["-Wno-fatal"] if sim == "verilator" else []
         runner.build(sources=RTL, hdl_toplevel="neurocore", parameters=params,
                      build_dir=bdir, always=True, build_args=build_args, timescale=("1ns", "1ps"))
         _runners[(sim, cfg_name)] = runner
-    full_env = {"N": c["N"], "A": c["A"], "LANES": c["LANES"], "W": c["W"], "FD": c["FD"], "X": X, "Y": Y}
+    full_env = {"N": c["N"], "A": c["A"], "LANES": c["LANES"], "W": c["W"], "FD": c["FD"], "X": X, "Y": Y,
+                "LEARN": c.get("LEARN", 0)}
     full_env.update(env)
     full_env = {k: str(v) for k, v in full_env.items()}
     full_env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "tests/core"), os.environ.get("PYTHONPATH", "")])
@@ -100,6 +109,37 @@ def test_big_cycles():
     _run("icarus", "big", "test_cycles", SEED=1)
 
 
+# ---------------- on-chip learning (SG6) ----------------
+@pytest.mark.parametrize("seed,mode", [
+    (101, "stdp"), (102, "stdp"), (103, "stdp_s0"), (104, "stdp_ext"),
+    (105, "rstdp"), (106, "rstdp"), (107, "rstdp_s0"), (108, "rstdp_ext"),
+    (109, "stdp_bigshift"), (110, "rstdp_bigshift"),
+])
+def test_learn_small(seed, mode):
+    _run("icarus", "small_l2", "test_learn", SEED=seed, MODE=mode, STEPS=10, BP=0.3)
+
+
+@pytest.mark.parametrize("cfg,seed,mode", [
+    ("w4_l2", 111, "stdp"), ("w4_l2", 112, "rstdp_ext"),
+    ("g1_l2", 113, "stdp_ext"), ("g1_l2", 114, "rstdp"),
+    ("l1_l2", 115, "stdp"), ("l1_l2", 116, "rstdp_s0"),
+    ("rect_l2", 117, "stdp"), ("rect_l2", 118, "rstdp"),
+    ("small_l1", 119, "stdp"), ("small_l1", 120, "stdp_ext"),
+])
+def test_learn_variants(cfg, seed, mode):
+    _run("icarus", cfg, "test_learn", SEED=seed, MODE=mode, STEPS=8, BP=0.3)
+
+
+def test_learn_build_inference_unchanged():
+    """learn_en = 0 on a LEARN=2 build behaves exactly like inference."""
+    _run("icarus", "small_l2", "test_random", SEED=121, MODE="mixed", STEPS=12, BP=0.3)
+    _run("icarus", "small_l2", "test_cfg_readback", SEED=122, BP=0.3)
+
+
+def test_learn_big():
+    _run("icarus", "big_l2", "test_learn", SEED=131, MODE="rstdp", STEPS=3, BP=0.2, FULL_EVERY=3)
+
+
 # ---------------- Verilator ----------------
 # cocotb 2.1's Verilator support needs Verilator >= 5.036 (5.020 installed), so
 # the Verilator run replays a golden-generated command trace through
@@ -118,12 +158,13 @@ def _vl(cfg_name, **env):
                "-j", "4", "--top-module", "tb_replay", "-Mdir", str(work / "obj"), "-o", "Vtb",
                f"-GX={X}", f"-GY={Y}", f"-GN_NEURONS={c['N']}", f"-GN_AXONS={c['A']}",
                f"-GW_BITS={c['W']}", f"-GFANOUT_DEPTH={c['FD']}", f"-GLANES={c['LANES']}",
+               f"-GLEARN={c.get('LEARN', 0)}",
                str(ROOT / "tests/core/tb_replay.sv"), *map(str, RTL)]
         subprocess.run(cmd, check=True, capture_output=True, timeout=600)
         _vl_bins[cfg_name] = work / "obj" / "Vtb"
     full_env = dict(os.environ)
     full_env.update({"N": c["N"], "A": c["A"], "LANES": c["LANES"], "W": c["W"], "FD": c["FD"],
-                     "X": X, "Y": Y, **env})
+                     "X": X, "Y": Y, "LEARN": c.get("LEARN", 0), **env})
     full_env = {k: str(v) for k, v in full_env.items()}
     full_env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "tests/core")])
     r = subprocess.run([sys.executable, str(ROOT / "tests/core/vl_replay.py"), str(_vl_bins[cfg_name]), str(work)],
@@ -146,3 +187,12 @@ def test_verilator_small_random(seed, mode):
 @pytest.mark.parametrize("seed,mode", [(71, "mixed"), (72, "accsat")])
 def test_verilator_big_random(seed, mode):
     _vl("big", SEED=seed, MODE=mode, STEPS=8, BP=0.3)
+
+
+@needs_vl
+@pytest.mark.parametrize("cfg,seed,mode,steps", [
+    ("small_l2", 141, "stdp", 40), ("small_l2", 142, "rstdp", 40), ("small_l2", 143, "rstdp_ext", 40),
+    ("big_l2", 151, "stdp", 10), ("big_l2", 152, "rstdp", 10),
+])
+def test_verilator_learn(cfg, seed, mode, steps):
+    _vl(cfg, SEED=seed, MODE=mode, STEPS=steps, BP=0.3)

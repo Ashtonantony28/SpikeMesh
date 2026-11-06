@@ -1,10 +1,14 @@
-# rtl/core: SpikeMesh neurocore (SG2, inference)
+# rtl/core: SpikeMesh neurocore (SG2 inference, SG6 on-chip learning)
 
 Files:
 
 | File | Content |
 |---|---|
-| `neurocore.sv` | The core. Port list as in SPEC §8, plus parameters `LANES` (default 8) and `ACC_W` (default `W_BITS + log2(N_AXONS) + 1`, SPEC §2). |
+| `neurocore.sv` | The core. Port list as in SPEC §8, plus parameters `LANES` (default 8) and `ACC_W` (default `W_BITS + log2(N_AXONS) + 1`, SPEC §2), and `LEARN`:
+  - 0 (default): inference only, no learning hardware.
+  - 1: STDP. `rstdp_en` is ignored.
+  - 2: STDP + R-STDP, which adds the eligibility memory. |
+| `learn_engine.sv` | SPEC §6 learning (STDP, R-STDP). It is instantiated only when `LEARN > 0`. |
 | `sram_1r1w.sv` | The only memory primitive: 1 write port and 1 registered read port on a single clock, with an optional per-lane write mask. It infers BRAM/LUTRAM on FPGA and can be replaced by a 1R1W SRAM macro wrapper for ASIC. Its contents are not reset. |
 
 ## Memories
@@ -61,20 +65,46 @@ CFG and READ flits, and spikes for the bank being updated, are held off by head-
 
 `in_ready` depends combinationally on `in_flit` and `in_valid`. That is legal valid/ready, but the router must not make `in_valid` depend on `in_ready`.
 
-**LEARN**
+**LEARN** (`learn_engine.sv`, SPEC §6)
 
-- `learn_start` with `learn_en = 0` does nothing: `busy` is high for that cycle and the next. With `learn_en = 1` LEARN is still a 1-cycle no-op until SG6.
-- Hooks for the SG6 learning engine, present but not used:
-  - `hook_pre_valid/axon`: a spike accepted while `learn_en` is set.
-  - `hook_post_valid/neuron`: a neuron fired in stage C while `learn_en` is set.
-  - `learn_busy`: the place for the learn FSM.
-  - The weight memory's write port is used only by CFG today, so the learn engine can take it.
+- `learn_start` latches a request. LEARN begins once no spike is mid-accumulation and UPDATE is idle. With `learn_en = 0`, or with `LEARN = 0`, it completes right away.
+- **State**:
+  - `x_pre[A]`: memory, 8 bit.
+  - `x_post[N]`: memory, G × LANES·8.
+  - `pre_flag[A]`, `post_flag[N]`: flip-flops. `pre_flag` is set when a spike is accepted while `learn_en` is set. `post_flag[n]` is overwritten with `fire` for every neuron in UPDATE stage C, as golden does.
+  - The 16-bit Galois LFSR: reloaded on every CFG write of `lfsr_seed` (0 becomes 1), and reset to 1.
+  - LEARN=2 only: `e[a][n]` (int16), laid out like the weight memory.
+- **Phases.** LEARN runs the SPEC order. Every phase drains its 1-cycle read→compute→write pipeline before the next phase starts.
+  1. **DECAY**: x_pre and x_post decay. Skipped when both shifts are 0.
+  2. **ELIG** (R-STDP only, when `tau_elig ≠ 0` or reward ≠ 0): one weight row per cycle. It computes `e -= e>>>tau_elig`, then, if reward ≠ 0, `w = clamp(w + (r·e >>> reward_shift))`. This uses 8 lane-parallel 32×16 multipliers. The reward sum is cleared when it is applied.
+  3. **DEP**: scans axons in ascending order, 1 cycle per axon. For each flagged axon it processes the row LANES weights per cycle. The LFSR advances LANES steps per cycle as an unrolled chain, with lane 0 first, which gives ascending n.
+  4. **POT**: scans neurons in ascending order. For each flagged neuron it processes the column 1 weight per cycle, with axons ascending, 1 LFSR step each, and a lane-masked write.
+  5. **BUMP**: trace bumps with usat8, then all flags are cleared.
+- **Stochastic rounding** is exact for every 16-bit `stdp_shift`. The product is at most 24 bits, so `s ≥ 24` is evaluated as `s = 24`. The other shift amounts saturate the same way: trace shifts at 8, `tau_elig` at 15, `reward_shift` at 47.
+- **Cycles per LEARN:**
 
-**busy** = reset clear | input FSM not IDLE | write-back pending | learn | `update_start` | `learn_start` | UPDATE pending/active | output FIFO non-empty.
+  ```
+  2 + [max(A,G)+2 if tau_pre|tau_post] + [A·G+2 if R-STDP elig/reward]
+    + (A+1 + #pre·G) + (N+1 + #post·A) + (max(A,G)+2)
+  ```
+
+  Measured at 32/32/LANES=4: 147–683 cycles for STDP. At 256/256/LANES=8 with R-STDP: 14.5k cycles with 166 pre-flags and 0 post-flags, 35.3k cycles with 144 pre and 84 post. Potentiation, at A cycles per firing neuron, dominates. Its column-major LFSR order is fixed by the spec.
+- **Debug addresses** (proposed; these are not in SPEC yet). Region 11 `[19:16]` selects a sub-space, and `[15:0]` is the index:
+  - 0: core registers, as before.
+  - 1: `x_pre[a]`, read/write.
+  - 2: `x_post[n]`, read/write.
+  - 3: `pre_flag[a]`, read only.
+  - 4: `post_flag[n]`, read only.
+  - 5: index 0 is the LFSR state, index 1 the reward sum [15:0], index 2 the reward sum [31:16]. Read only.
+  - Register 22 bit 0 (LEARN=2): region-00 reads and writes address `e[a][n]` instead of `w[a][n]`.
+  - All of these read 0 when `LEARN=0`.
+- **Limits.** The reward sum is held as a 32-bit int, where golden's is unbounded. `w_min`/`w_max` must lie inside the W_BITS range, because a clamped weight is stored as W_BITS bits.
+
+**busy** = reset clear | input FSM not IDLE | write-back pending | LEARN pending/running | `update_start` | `learn_start` | UPDATE pending/active | output FIFO non-empty.
 
 ## Verification
 
-`python -m pytest -q tests/core` runs 28 tests in about 65 s:
+`python -m pytest -q tests/core` runs 55 tests in about 165 s. The SG2 inference tests are below; the SG6 learning tests are listed after them.
 
 - **cocotb + Icarus.** The tests use `tests/core/core_tb.py`, a single-coroutine valid/ready driver. It applies random `in_valid` gaps and random `out_ready` backpressure, and loops self-addressed output spikes back into the input. Each test checks timestep-exact against `golden.spikemesh.Core`:
   - the multiset of output flits per timestep;
@@ -87,23 +117,31 @@ CFG and READ flits, and spikes for the bank being updated, are held off by head-
   - Edge cases: LANES=N (G=1, forwarding path) and LANES=1.
   - N=A=256/LANES=8: sparse random, plus `accsat` (every axon twice, |acc| > 32767 in both signs), plus cycle counts.
 - **Verilator.** cocotb 2.1 needs Verilator 5.036 or newer, and 5.020 is installed. Instead, `vl_replay.py` writes a golden-generated command trace that `tb_replay.sv` replays: 4 small seeds × 40 steps, and 2 runs at 256/8 × 8 steps.
+- **Learning (SG6)**, `core_tb.test_learn`, on LEARN=2/1 builds:
+  - Randomized multi-step runs with random spikes and loopback, rewards before LEARN and during UPDATE, random initial traces and eligibility written through the debug addresses, and random learning registers.
+  - Every timestep checks spike flits, plus x_pre, x_post, both flag arrays, the LFSR state and the reward sum. Every 3rd step checks all weights and all eligibility against golden.
+  - The `learn_start` pulse sometimes lands while a spike is still accumulating.
+  - Modes: stdp, rstdp, stdp_s0/rstdp_s0 (`stdp_shift=0`), *_ext (wide register values), and *_bigshift (`stdp_shift` 24..63, `reward_shift` ≥ 64).
+  - Configs: 32/32/LANES=4 with 10 seeds; W4/LANES=8; LANES=N; LANES=1; N=64/A=16/LANES=2; LEARN=1; one Icarus run at 256/256/LANES=8. learn_en=0 on a LEARN=2 build reruns the inference and readback tests.
+  - Verilator replay adds 3 small runs × 40 steps and 2 runs at 256/8 × 10 steps, each with a full readback of weights and eligibility.
+- **Learning self-check.** 20 hand mutations of learning logic. 18 are killed: LFSR taps, seed-0 rule, sr compare, shift saturations, DEP lane order, POT LFSR step, clamp order, eligibility arithmetic shift, reward-zero skip, reward clear, decay skip, bump saturation, flag clear, POT trace source, R-STDP writing weights, weight sign extension, and LEARN waiting for accumulation. 2 are equivalent under the protocol: post_flag OR versus overwrite, since LEARN always clears flags before the next UPDATE; and the extra drain wait, since the scan and pipeline already give the one-cycle gap.
 - **Self-check.** Hand mutations of the RTL are all caught: leak logical shift, parity not flipped, forwarding off, output FIFO overflow, missing emitter credit, spike-FIFO headroom, v_min, refractory v, both acc saturations, reset_mode, host src swap, and the in_ready UPDATE gate.
 
-Lint: `verilator --lint-only -Wall rtl/core/neurocore.sv rtl/core/sram_1r1w.sv` is clean at all tested parameter sets. The only waivers are UNUSEDSIGNAL on sliced 32-bit index temporaries, the flit dest bits, and the SG6 hooks.
+Lint: `verilator --lint-only -Wall rtl/core/neurocore.sv rtl/core/learn_engine.sv rtl/core/sram_1r1w.sv` is clean for LEARN=0/1/2 at all tested parameter sets. The only waivers are UNUSEDSIGNAL on sliced 32-bit index temporaries, the flit dest bits, and the tie-offs of unused build options.
 
-## Synthesis (N=A=256, LANES=8, FANOUT_DEPTH=1024, Yosys 0.33)
+## Synthesis (N=A=256, LANES=8, FANOUT_DEPTH=1024, Yosys 0.33, `synth_xilinx -family xcup -flatten`)
 
-`synth_xilinx -family xcup -flatten` gives:
+| Resource | LEARN=0 | LEARN=1 (STDP) | LEARN=2 (+R-STDP) |
+|---|---|---|---|
+| LUTs | 1625 | 7653 | 11038 |
+| FFs | 865 | 1656 | 1627 |
+| CARRY4 | 76 | 651 | 736 |
+| DSP48E2 | 0 | 10 | 24 |
+| RAMB36E2 | 16 | 16 | 48 (+1 Mbit eligibility) |
+| RAMB18E2 | 5 | 5 | 5 |
+| RAM32M16 / RAM64M8 | 26 / 4 | 34 / 12 | 34 / 12 |
+| Estimated LCs | 1128 | 5728 | 8016 |
 
-| Resource | Count |
-|---|---|
-| RAMB36E2 | 16 (weights) |
-| RAMB18E2 | 5 |
-| RAM32M16 / RAM64M8 | 26 / 4 (accumulator banks and small RAMs as LUTRAM) |
-| LUTs | 1618 (LUT1–6) |
-| CARRY4 | 76 |
-| FFs | 865 |
+LEARN=0 matches the SG2 inference-only core to within a few LUTs; the difference is the region-11 sub-space decode. The learning logic is mostly the lane-parallel stochastic-rounding and clamp datapath, the flag muxes, and, for LEARN=2, the 8 reward multipliers.
 
-Estimated LCs: 1115.
-
-Generic `synth` with `sram_1r1w` blackboxed (logic only) gives 5961 cells: 9 SRAM instances, 870 flip-flops, and about 5080 gates/muxes. Total memory is about 565 Kbit, of which weights are 512 Kbit.
+At SG2, generic `synth` with `sram_1r1w` blackboxed (logic only) gave 5961 cells for LEARN=0: 870 flip-flops and about 5080 gates/muxes.

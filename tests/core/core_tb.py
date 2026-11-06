@@ -7,6 +7,7 @@ tests/core/test_core.py (N, A, LANES, W, FD, X, Y, SEED, STEPS, MODE, BP).
 """
 from __future__ import annotations
 
+import os
 import random
 from collections import Counter, deque
 
@@ -16,9 +17,10 @@ from cocotb.triggers import FallingEdge, ReadOnly
 
 from compiler import flits
 from golden.spikemesh import Core, REG_INDEX
-from core_model import (N, A, W, FD, CX, CY, G, SEED, STEPS, MODE, BP, IN_GAP, COV, LANES,
+from core_model import (N, A, W, FD, CX, CY, G, SEED, STEPS, MODE, BP, IN_GAP, COV, LANES, LEARN,
                         cfg, all_weight_flits, random_network, golden_step, make_events,
-                        state_addrs, check_coverage)
+                        state_addrs, check_coverage, learn_config, learn_light_addrs, learn_expected,
+                        REG_DBG_ELIG)
 
 class Harness:
     """Single-coroutine cycle driver: drive on the falling edge, sample after
@@ -195,6 +197,8 @@ async def test_cfg_readback(dut):
             v = rng.randint(0, 15)
         elif name == "reset_mode":
             v = rng.randint(0, 1)
+        elif r == REG_DBG_ELIG:
+            v = 0          # debug register: would redirect weight writes to e[a][n]
         else:
             v = rng.randint(0, 0xFFFF)
         fl.append(cfg(g, flits.addr_reg(r), v))
@@ -262,3 +266,97 @@ async def test_cycles(dut):
     dut._log.info(f"CYCLES N={N} A={A} LANES={LANES}: {K} back-to-back spikes in {spk} cycles "
                   f"({spk / K:.2f}/spike, G={G}); UPDATE no-fire {upd0} cycles; "
                   f"UPDATE all-fire (1 flit each) {upd1} cycles")
+
+
+async def check_learn_state(h: Harness, g, rng, pending_pre, full, n_weights=None):
+    """Read back traces/flags/LFSR/reward (+ weights and eligibility if full)."""
+    import numpy as np
+    addrs = learn_light_addrs()
+    if full:
+        if n_weights is None:
+            waddrs = [flits.addr_weight(a, n, N) for a in range(A) for n in range(N)]
+        else:
+            waddrs = [flits.addr_weight(rng.randrange(A), rng.randrange(N), N) for _ in range(n_weights)]
+        addrs += waddrs
+    got = await h.read(addrs)
+    exp = [learn_expected(g, a, pending_pre) for a in addrs]
+    bad = [(hex(a), x, y) for a, x, y in zip(addrs, got, exp) if x != y]
+    assert not bad, f"{len(bad)} learn-state mismatches (addr, rtl, golden): {bad[:12]}"
+    if full and LEARN == 2:
+        await h.send([flits.cfg_write(CX, CY, flits.addr_reg(REG_DBG_ELIG), 1)])
+        got = await h.read(waddrs)
+        await h.send([flits.cfg_write(CX, CY, flits.addr_reg(REG_DBG_ELIG), 0)])
+        exp = [int(g.elig[(a & 0xFFFFF) // N, (a & 0xFFFFF) % N]) & 0xFFFF for a in waddrs]
+        bad = [(hex(a), x, y) for a, x, y in zip(waddrs, got, exp) if x != y]
+        assert not bad, f"{len(bad)} eligibility mismatches: {bad[:12]}"
+    return np
+
+
+@cocotb.test()
+async def test_learn(dut):
+    """Multi-step STDP / R-STDP run vs golden: spikes per step, traces, flags,
+    LFSR and reward state every step, all weights and eligibility periodically."""
+    rng = random.Random(SEED)
+    h = Harness(dut, rng, bp=0.0, in_gap=0.0)
+    await h.start()
+    g, fl, host_axons = random_network(rng, "mixed")
+    lfl, ordered = learn_config(rng, g, MODE)
+    fl += lfl
+    rng.shuffle(fl)
+    await h.send(fl)
+    await h.send(ordered)
+    await check_learn_state(h, g, rng, frozenset(), True, None if A * N <= 4096 else 512)
+    h.bp, h.in_gap = BP, IN_GAP
+    events = make_events(rng, host_axons, "mixed")
+    loop_next: list[int] = []
+    early = False
+    learn_log = []
+    full_every = int(os.environ.get("FULL_EVERY", 3))
+    for t in range(STEPS):
+        p = t & 1
+        h.parity = p
+        if not early:
+            h.in_q.extend(flits.spike(CX, CY, a, p) for a in events[t])
+        for _ in range(rng.choice([0, 0, 1, 2])):
+            r = rng.randint(-200, 200)
+            g.receive_reward(r)
+            h.in_q.append(flits.reward(CX, CY, r))
+        if rng.random() < 0.3:
+            # pulse learn_start as soon as the last input flit is accepted (its
+            # accumulation may still be running): LEARN must wait for it
+            await h.run_until(lambda: not h.in_q, 100000)
+        else:
+            await h.idle(2)
+        n_pre = len(set(events[t] + loop_next))
+        n_post = int(g.post_flag.sum())
+        exp, loop = golden_step(g, t, events[t] + loop_next)
+        loop_next = loop
+        h.pulse = "learn"
+        c0 = h.cycles
+        await h.cycle()
+        await h.run_until(lambda: not h.busy, 2_000_000)
+        learn_log.append((h.cycles - c0, n_pre, n_post))
+        h.tag = t
+        h.pulse = "update"
+        await h.cycle()
+        if rng.random() < 0.3:          # reward arriving during UPDATE(t) counts for LEARN(t+1)
+            r = rng.randint(-200, 200)
+            g.receive_reward(r)
+            h.in_q.append(flits.reward(CX, CY, r))
+        early = rng.random() < 0.5
+        if early:
+            h.in_q.extend(flits.spike(CX, CY, a, p ^ 1) for a in events[t + 1])
+        await h.run_until(lambda: not h.busy, 2_000_000)
+        await h.idle(2)
+        got = [f for tag, f in h.out_log if tag == t]
+        if Counter(got) != Counter(exp):
+            extra = Counter(got) - Counter(exp)
+            missing = Counter(exp) - Counter(got)
+            raise AssertionError(f"t={t}: extra={[hex(f) for f in extra]} missing={[hex(f) for f in missing]}")
+        h.tag = -2
+        pending = frozenset(loop_next + (events[t + 1] if early else []))
+        full = (t % full_every == full_every - 1) or t == STEPS - 1
+        await check_learn_state(h, g, rng, pending, full, None if A * N <= 4096 else 1024)
+    dut._log.info(f"LEARN MODE={MODE} SEED={SEED} N={N} A={A} LANES={LANES} W={W} LEARN={LEARN}: "
+                  f"{STEPS} steps OK; LEARN cycles (cycles, #pre, #post) {learn_log}; "
+                  f"lfsr={g.lfsr.state:#06x} reward={g.pending_reward}")
