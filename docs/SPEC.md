@@ -28,7 +28,7 @@ Per-core configuration registers (shared by all neurons in the core):
 
 Per-neuron state and parameters: `v` (int16), `refc` (uint4 refractory counter), `bias` (int16).
 
-Per-neuron, per-timestep input: `acc` = exact (non-saturating) sum of the weights of every synapse that received a spike for this timestep. Hardware must make the accumulator wide enough that it cannot overflow: `W_BITS + log2(N_AXONS) + 1` bits.
+Per-neuron, per-timestep input: `acc` = exact (non-saturating) sum of the weights of every synapse that received a spike for this timestep. Hardware must make the accumulator wide enough that it cannot overflow: `W_BITS + log2(N_AXONS) + 1` bits, which is exact when each axon receives at most one spike per timestep. The compiler guarantees that (each axon has one source); hand-built traffic that sends repeated spikes to one axon in one timestep must raise the RTL `ACC_W` parameter.
 
 Update of one neuron at timestep t (exactly this order):
 
@@ -151,7 +151,7 @@ All modules: single clock `clk`, active-low synchronous reset `rst_n`. Flit stre
 | `update_start` | in | 1-cycle pulse: run UPDATE(t) on bank `parity`, emit spikes tagged `parity ^ 1` |
 | `busy` | out | High while the core has any work pending (input flit being processed, LEARN, UPDATE, or output flits not yet accepted) |
 
-The core accepts SPIKE, CFG_WRITE, READ_REQ and CTRL flits at any time except that it may deassert `in_ready` while busy with LEARN/UPDATE or while a read response is waiting.
+The core accepts SPIKE, CFG_WRITE, READ_REQ and CTRL flits. During UPDATE it must keep accepting SPIKE flits for parity `p ^ 1` and CTRL flits (otherwise recurrent or self fan-out can deadlock the mesh); it may stall CFG_WRITE, READ_REQ and SPIKE flits for parity `p` until UPDATE ends. Hosts must not send CFG_WRITE or READ_REQ during a STEP. `in_ready` may depend combinationally on `in_flit`, so upstream `in_valid` must not depend on `in_ready`.
 
 `router #(X, Y)`: five ports (N, S, E, W, L). XY routing per §4. Input FIFO depth `FIFO_DEPTH` (default 4). Round-robin output arbitration. A packet is never dropped or duplicated.
 
