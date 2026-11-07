@@ -5,6 +5,9 @@
 //   * uart_bridge: 8N1 UART on two PL pins (PMOD + USB-UART adapter)
 // The AXI-Lite register CTRL[8] (HOST_SEL) selects the bridge. Its reset value
 // is HOST_SEL_RST. Both bridges use the same word protocol (fpga/rtl/flit_link.sv).
+// LEARN_MASK / LEARN_MODE pass through to spikemesh_top: bit (y*MESH_X + x)
+// gives that core learning hardware (LEARN_MODE 1 = STDP, 2 = STDP + R-STDP).
+// 32 bits here (enough for any mesh the KV260 fits), zero-extended.
 `default_nettype none
 
 module kv260_top #(
@@ -17,8 +20,10 @@ module kv260_top #(
     parameter integer LANES        = 8,
     parameter integer CLK_HZ       = 100_000_000,
     parameter integer BAUD         = 921_600,
-    parameter integer DRAIN_CYCLES = 64,
-    parameter integer HOST_SEL_RST = 0
+    parameter integer DRAIN_CYCLES = 0,
+    parameter integer HOST_SEL_RST = 0,
+    parameter integer LEARN_MASK   = 0,
+    parameter integer LEARN_MODE   = 1
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -65,13 +70,13 @@ module kv260_top #(
     wire        c_in_valid, c_in_ready, c_out_valid, c_out_ready, c_step, c_step_done, c_running;
     wire [47:0] c_in_flit, c_out_flit;
     wire [7:0]  c_drop;
-    /* verilator lint_off UNUSEDSIGNAL */
-    wire        c_drained;   // spikemesh_top quiet flag; the link uses its own drain timer
-    /* verilator lint_on UNUSEDSIGNAL */
+    wire        c_drained;   // spikemesh_top: mesh drained, used for STEP_DONE / FLUSH_DONE
 
+    localparam [31:0] LMASK32 = LEARN_MASK;
     spikemesh_top #(
         .MESH_X(MESH_X), .MESH_Y(MESH_Y), .N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS),
-        .W_BITS(W_BITS), .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES)
+        .W_BITS(W_BITS), .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES),
+        .LEARN_MASK(225'(LMASK32)), .LEARN_MODE(LEARN_MODE)
     ) u_chip (
         .clk(clk), .rst_n(c_rst_n),
         .host_in_valid(c_in_valid), .host_in_ready(c_in_ready), .host_in_flit(c_in_flit),
@@ -108,7 +113,7 @@ module kv260_top #(
         .chip_rst_n(a_rst_n), .chip_in_valid(a_in_valid), .chip_in_ready(c_in_ready && !host_sel),
         .chip_in_flit(a_in_flit), .chip_out_valid(c_out_valid && !host_sel), .chip_out_ready(a_out_ready),
         .chip_out_flit(c_out_flit), .chip_step(a_step), .chip_step_done(c_step_done && !host_sel),
-        .chip_t_parity(t_parity), .chip_running(c_running), .chip_err(chip_err), .chip_drop_cnt(c_drop),
+        .chip_t_parity(t_parity), .chip_running(c_running), .chip_err(chip_err), .chip_drop_cnt(c_drop), .chip_drained(c_drained),
         .uart_rx_overflow(u_ovf), .uart_frame_err(u_ferr), .host_sel(host_sel));
 
     uart_bridge #(.CLK_HZ(CLK_HZ), .BAUD(BAUD), .MESH_X(MESH_X), .MESH_Y(MESH_Y),
@@ -117,7 +122,7 @@ module kv260_top #(
         .chip_rst_n(u_rst_n), .chip_in_valid(u_in_valid), .chip_in_ready(c_in_ready && host_sel),
         .chip_in_flit(u_in_flit), .chip_out_valid(c_out_valid && host_sel), .chip_out_ready(u_out_ready),
         .chip_out_flit(c_out_flit), .chip_step(u_step), .chip_step_done(c_step_done && host_sel),
-        .chip_t_parity(t_parity), .chip_running(c_running), .chip_err(chip_err), .chip_drop_cnt(c_drop),
+        .chip_t_parity(t_parity), .chip_running(c_running), .chip_err(chip_err), .chip_drop_cnt(c_drop), .chip_drained(c_drained),
         .rx_overflow(u_ovf), .rx_frame_err(u_ferr), .link_busy(u_busy));
 
     assign c_rst_n     = host_sel ? u_rst_n : a_rst_n;

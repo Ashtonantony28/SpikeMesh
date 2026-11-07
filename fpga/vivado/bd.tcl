@@ -8,7 +8,7 @@
 #   uart_rx / uart_tx are BD ports (PMOD pins, see kv260.xdc).
 # PYNQ names: overlay.axi_dma_0, overlay.spikemesh_0 (host/fpga_backend.py).
 
-proc create_spikemesh_bd {name mesh_x mesh_y host_sel baud have_board} {
+proc create_spikemesh_bd {name mesh_x mesh_y host_sel baud have_board {learn_mask 0} {learn_mode 1}} {
     create_bd_design $name
     current_bd_design $name
 
@@ -52,6 +52,7 @@ proc create_spikemesh_bd {name mesh_x mesh_y host_sel baud have_board} {
     set_property -dict [list \
         CONFIG.MESH_X $mesh_x CONFIG.MESH_Y $mesh_y \
         CONFIG.HOST_SEL_RST $host_sel CONFIG.BAUD $baud CONFIG.CLK_HZ {100000000} \
+        CONFIG.LEARN_MASK $learn_mask CONFIG.LEARN_MODE $learn_mode \
     ] $sm
 
     # ---- interconnect

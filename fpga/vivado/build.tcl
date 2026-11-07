@@ -1,9 +1,10 @@
 # SpikeMesh on the Kria KV260: non-project-mode Vivado build.
 #
 #   cd fpga/vivado
-#   vivado -mode batch -source build.tcl -tclargs [MESH_X] [MESH_Y] [HOST_SEL_RST] [BAUD]
+#   vivado -mode batch -source build.tcl -tclargs [MESH_X] [MESH_Y] [HOST_SEL_RST] [BAUD] [LEARN_MASK] [LEARN_MODE]
 #
-# Defaults: 2 2 0 921600. HOST_SEL_RST: 0 = AXI DMA path (PYNQ), 1 = UART on PMOD.
+# Defaults: 2 2 0 921600 0 1. LEARN_MASK is a decimal core mask (bit y*MESH_X+x),
+# LEARN_MODE 1 = STDP, 2 = STDP + R-STDP. HOST_SEL_RST: 0 = AXI DMA path (PYNQ), 1 = UART on PMOD.
 # Outputs go to build_<X>x<Y>/: spikemesh.bit, spikemesh.hwh (PYNQ),
 # spikemesh.xsa, and utilization/timing reports.
 # Written for Vivado 2022.2 or newer. This script has not been run in the
@@ -19,11 +20,17 @@ if {$argc >= 1} { set mesh_x   [lindex $argv 0] }
 if {$argc >= 2} { set mesh_y   [lindex $argv 1] }
 if {$argc >= 3} { set host_sel [lindex $argv 2] }
 if {$argc >= 4} { set baud     [lindex $argv 3] }
+set learn_mask 0
+set learn_mode 1
+if {$argc >= 5} { set learn_mask [lindex $argv 4] }
+if {$argc >= 6} { set learn_mode [lindex $argv 5] }
 
 set part xck26-sfvc784-2LV-c
-set out  [file join $script_dir "build_${mesh_x}x${mesh_y}"]
+set suffix ""
+if {$learn_mask != 0} { set suffix "_learn${learn_mask}m${learn_mode}" }
+set out  [file join $script_dir "build_${mesh_x}x${mesh_y}${suffix}"]
 file mkdir $out
-puts "SpikeMesh build: mesh ${mesh_x}x${mesh_y}, HOST_SEL_RST=$host_sel, BAUD=$baud, part $part -> $out"
+puts "SpikeMesh build: mesh ${mesh_x}x${mesh_y}, HOST_SEL_RST=$host_sel, BAUD=$baud, LEARN_MASK=$learn_mask, LEARN_MODE=$learn_mode, part $part -> $out"
 
 create_project -in_memory -part $part
 set board [lindex [get_board_parts -quiet -latest_file_version {*kv260_som*}] 0]
@@ -60,7 +67,7 @@ update_compile_order -fileset sources_1
 
 # ---- block design
 source [file join $script_dir bd.tcl]
-create_spikemesh_bd spikemesh_bd $mesh_x $mesh_y $host_sel $baud [expr {$board ne ""}]
+create_spikemesh_bd spikemesh_bd $mesh_x $mesh_y $host_sel $baud [expr {$board ne ""}] $learn_mask $learn_mode
 set bd_file [get_files spikemesh_bd.bd]
 set_property synth_checkpoint_mode None $bd_file
 generate_target all $bd_file

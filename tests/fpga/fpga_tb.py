@@ -401,6 +401,9 @@ async def test_axi_backend_net(dut):
     assert c["step_count"] == T, c
     assert c["last_step_cycles"] > 0 and c["busy_cycles"] >= c["last_step_cycles"], c
     assert c["in_flits"] > 0 and c["out_flits"] > 0 and c["drop_cnt"] == 0, c
+    drain = int(os.environ.get("DRAIN", 0))
+    if drain:       # idle-timer fallback: at least DRAIN quiet cycles after step_done
+        assert c["last_drain_cycles"] >= drain, c
     assert c["status"] & 1 and not c["status"] & 0b1000, c        # done sticky, no error
     assert be.config == {"mesh_x": MX, "mesh_y": MY, "lanes": int(os.environ.get("LANES", 4)), "w_bits": 8,
                          "n_neurons": N, "n_axons": A}, be.config

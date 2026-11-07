@@ -29,7 +29,7 @@ module axis_bridge #(
     parameter integer N_AXONS      = 256,
     parameter integer W_BITS       = 8,
     parameter integer LANES        = 8,
-    parameter integer DRAIN_CYCLES = 64,
+    parameter integer DRAIN_CYCLES = 0,
     parameter integer HOST_SEL_RST = 0
 ) (
     input  wire        clk,
@@ -87,6 +87,7 @@ module axis_bridge #(
     input  wire        chip_running,
     input  wire        chip_err,
     input  wire [7:0]  chip_drop_cnt,
+    input  wire        chip_drained,     // spikemesh_top drained (DRAIN_CYCLES = 0)
     // misc
     input  wire        uart_rx_overflow,
     input  wire        uart_frame_err,
@@ -107,7 +108,7 @@ module axis_bridge #(
         .chip_in_valid(chip_in_valid), .chip_in_ready(chip_in_ready), .chip_in_flit(chip_in_flit),
         .chip_out_valid(chip_out_valid), .chip_out_ready(chip_out_ready), .chip_out_flit(chip_out_flit),
         .chip_step(chip_step), .chip_step_done(chip_step_done), .chip_t_parity(chip_t_parity),
-        .chip_running(chip_running), .chip_err(chip_err), .chip_drop_cnt(chip_drop_cnt),
+        .chip_running(chip_running), .chip_err(chip_err), .chip_drop_cnt(chip_drop_cnt), .chip_drained(chip_drained),
         .link_busy(link_busy), .done_pulse(done_pulse), .cmd_err(cmd_err),
         .step_count(step_count), .last_step_cycles(last_step_cycles),
         .last_drain_cycles(last_drain_cycles), .busy_cycles(busy_cycles),

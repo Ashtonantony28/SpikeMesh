@@ -35,21 +35,24 @@ FPGA = [ROOT / "fpga/rtl" / f for f in ("flit_link.sv", "uart_rx.sv", "uart_tx.s
                                          "axis_bridge.sv", "kv260_top.sv")]
 SRC = CORE + NOC + TOP + FPGA
 CFG = dict(MESH_X=2, MESH_Y=2, N_NEURONS=32, N_AXONS=32, W_BITS=8, FANOUT_DEPTH=64, LANES=4,
-           CLK_HZ=8_000_000, BAUD=1_000_000, DRAIN_CYCLES=32)
+           CLK_HZ=8_000_000, BAUD=1_000_000)
 ENV = {"MX": "2", "MY": "2", "N": "32", "A": "32", "FD": "64", "LANES": "4", "CPB": "8"}
 _runners: dict = {}
 
 
-def _run(host_sel: int, testcase: str, **env):
-    name = f"kv260_sel{host_sel}"
+def _run(host_sel: int, testcase: str, drain: int = 0, learn_mask: int = 0, **env):
+    """drain = 0: STEP_DONE waits for spikemesh_top `drained`; > 0: idle-timer fallback.
+    learn_mask: kv260_top LEARN_MASK (learning cores, LEARN_MODE 2)."""
+    name = f"kv260_sel{host_sel}" + (f"_timer{drain}" if drain else "") + (f"_lm{learn_mask}" if learn_mask else "")
     bdir = HERE / "sim_build" / name
     r = _runners.get(name)
     if r is None:
         r = get_runner("icarus")
-        r.build(sources=SRC, hdl_toplevel="kv260_top", parameters={**CFG, "HOST_SEL_RST": host_sel},
+        r.build(sources=SRC, hdl_toplevel="kv260_top", parameters={**CFG, "HOST_SEL_RST": host_sel, "DRAIN_CYCLES": drain,
+                                               "LEARN_MASK": learn_mask, "LEARN_MODE": 2},
                 build_dir=bdir, always=True, timescale=("1ns", "1ps"))
         _runners[name] = r
-    e = {**ENV, **{k: str(v) for k, v in env.items()}}
+    e = {**ENV, "DRAIN": str(drain), **{k: str(v) for k, v in env.items()}}
     e["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(HERE)])
     xml = r.test(hdl_toplevel="kv260_top", test_module="fpga_tb", testcase=testcase, build_dir=bdir,
                  test_dir=bdir, extra_env=e, results_xml=str(bdir / f"res_{testcase}.xml"))
@@ -68,6 +71,17 @@ def test_uart_backend_net():
 @pytest.mark.parametrize("seed,bp", [(5, 0.3), (6, 0.7)])
 def test_axi_backend_net(seed, bp):
     _run(0, "test_axi_backend_net", SEED=seed, BP=bp)
+
+
+def test_axi_backend_net_learning_cores():
+    """LEARN_MASK pass-through: cores (0,0) and (1,1) built with R-STDP hardware;
+    with learn_en = 0 (compiled inference image) the outputs must still match golden."""
+    _run(0, "test_axi_backend_net", learn_mask=0b1001, SEED=9, BP=0.3)
+
+
+def test_axi_backend_net_timer_fallback():
+    """DRAIN_CYCLES > 0: STEP_DONE after an idle timer instead of `drained`."""
+    _run(0, "test_axi_backend_net", drain=32, SEED=8, BP=0.3)
 
 
 @pytest.mark.skipif(shutil.which("verilator") is None, reason="verilator not available")

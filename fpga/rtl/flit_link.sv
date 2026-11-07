@@ -27,16 +27,21 @@
 // Event words carry o_last = 1 (AXI-Stream TLAST: one DMA transfer per event).
 //
 // Drain: after step_done the chip may still have host-bound spikes in the
-// routers (SPEC §8). The event word is emitted only after host_out_valid has
-// been low for DRAIN_CYCLES consecutive cycles, so every spike of UPDATE(t)
-// precedes STEP_DONE(t) in the output stream.
+// routers (SPEC §8). The event word (STEP_DONE / FLUSH_DONE) is emitted only
+// when the chip is drained, so every spike of UPDATE(t) precedes STEP_DONE(t)
+// in the output stream:
+//   DRAIN_CYCLES = 0 (default): spikemesh_top's `drained` (no STEP running,
+//     mesh and cores quiet, every UPDATE spike delivered to a core or to the
+//     host-out FIFO) AND host_out_valid low (that FIFO is empty). Exact.
+//   DRAIN_CYCLES > 0 (fallback, e.g. a chip without `drained`): host_out_valid
+//     low for DRAIN_CYCLES consecutive cycles. `chip_drained` is ignored.
 `default_nettype none
 
 module flit_link #(
     parameter integer MESH_X       = 2,
     parameter integer MESH_Y       = 2,
     parameter integer N_NEURONS    = 256,
-    parameter integer DRAIN_CYCLES = 64
+    parameter integer DRAIN_CYCLES = 0
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -66,6 +71,7 @@ module flit_link #(
     input  wire        chip_running,
     input  wire        chip_err,
     input  wire [7:0]  chip_drop_cnt,
+    input  wire        chip_drained,
     // status / counters
     output wire        link_busy,
     output reg         done_pulse,      // STEP_DONE emitted
@@ -81,7 +87,7 @@ module flit_link #(
     localparam [9:0] HDR = 10'b11_1111_1111;
     localparam [7:0] C_STEP = 8'h01, C_FLUSH = 8'h02, C_STATUS = 8'h03, C_RESET = 8'h04;
     localparam [7:0] E_STEP = 8'h81, E_FLUSH = 8'h82, E_STATUS = 8'h83, E_RESET = 8'h84;
-    localparam integer DW = $clog2(DRAIN_CYCLES + 1);
+    localparam integer DW = $clog2(((DRAIN_CYCLES > 0) ? DRAIN_CYCLES : 1) + 1);
     localparam [5:0] LOGN = 6'($clog2(N_NEURONS));
 
     localparam [2:0] L_IDLE = 3'd0, L_STEPW = 3'd1, L_RUN = 3'd2, L_DRAIN = 3'd3,
@@ -122,6 +128,9 @@ module flit_link #(
     function automatic [47:0] event_word(input [7:0] e, input [37:8] payload);
         event_word = {HDR, payload, e};
     endfunction
+
+    wire drain_ok = (DRAIN_CYCLES == 0) ? (chip_drained && !chip_out_valid)
+                                        : (quiet == DW'(DRAIN_CYCLES));
 
     wire [21:0] step_sat = (step_cyc > 32'h3FFFFF) ? 22'h3FFFFF : step_cyc[21:0];
 
@@ -172,7 +181,7 @@ module flit_link #(
                     drain_cyc <= drain_cyc + 32'd1;
                     if (chip_out_valid) quiet <= '0;
                     else if (quiet != DW'(DRAIN_CYCLES)) quiet <= quiet + 1'b1;
-                    if (quiet == DW'(DRAIN_CYCLES)) begin
+                    if (drain_ok) begin
                         if (ev_op == E_STEP) last_drain_cycles <= drain_cyc;
                         ev_word <= event_word(ev_op, (ev_op == E_STEP) ?
                                               {step_sat, 6'd0, chip_err, chip_t_parity} : 30'd0);

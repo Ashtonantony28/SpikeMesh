@@ -19,7 +19,7 @@ module uart_bridge #(
     parameter integer MESH_X        = 2,
     parameter integer MESH_Y        = 2,
     parameter integer N_NEURONS     = 256,
-    parameter integer DRAIN_CYCLES  = 64,
+    parameter integer DRAIN_CYCLES  = 0,
     parameter integer BYTE_FIFO     = 64,
     parameter integer CLKS_PER_BIT  = (CLK_HZ + BAUD / 2) / BAUD,
     parameter integer RESYNC_CYCLES = 16 * 10 * CLKS_PER_BIT
@@ -42,6 +42,7 @@ module uart_bridge #(
     input  wire        chip_running,
     input  wire        chip_err,
     input  wire [7:0]  chip_drop_cnt,
+    input  wire        chip_drained,     // spikemesh_top drained (DRAIN_CYCLES = 0)
     // status
     output reg         rx_overflow,
     output reg         rx_frame_err,
@@ -119,7 +120,7 @@ module uart_bridge #(
         .chip_in_valid(chip_in_valid), .chip_in_ready(chip_in_ready), .chip_in_flit(chip_in_flit),
         .chip_out_valid(chip_out_valid), .chip_out_ready(chip_out_ready), .chip_out_flit(chip_out_flit),
         .chip_step(chip_step), .chip_step_done(chip_step_done), .chip_t_parity(chip_t_parity),
-        .chip_running(chip_running), .chip_err(chip_err), .chip_drop_cnt(chip_drop_cnt),
+        .chip_running(chip_running), .chip_err(chip_err), .chip_drop_cnt(chip_drop_cnt), .chip_drained(chip_drained),
         .link_busy(link_busy), .done_pulse(done_pulse), .cmd_err(cmd_err),
         .step_count(step_count), .last_step_cycles(last_step_cycles),
         .last_drain_cycles(last_drain_cycles), .busy_cycles(busy_cycles),

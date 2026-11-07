@@ -22,13 +22,22 @@
 `kv260_top.sv`. The wrapper exists because Vivado module references can't
 use a SystemVerilog top. `kv260_top.sv` contains:
 
-* `spikemesh_top`: the chip (`rtl/top`), N = A = 256, W_BITS = 8, LANES = 8,
-  FANOUT_DEPTH = 1024, and LEARN = 0 (`spikemesh_top` has no LEARN parameter).
+* `spikemesh_top`: the chip (`rtl/top`) at SPEC v0.2, with N = A = 256, W_BITS = 8, LANES = 8,
+  FANOUT_DEPTH = 1024, and the adaptive threshold on.
+  * By default every core is inference-only.
+  * `LEARN_MASK` (bit `y*MESH_X + x`) gives selected cores learning hardware.
+  * `LEARN_MODE` picks the kind: 1 = STDP, 2 = STDP + R-STDP.
 * `axis_bridge`: the Zynq path (AXI DMA plus an AXI-Lite register block).
 * `uart_bridge`: an 8N1 UART, 921600 baud by default.
 
 Both bridges speak the same 48-bit word protocol through `flit_link.sv`.
 CTRL[8] (HOST_SEL) chooses which bridge drives the chip host port.
+
+STEP_DONE and FLUSH_DONE are sent once `spikemesh_top`'s `drained` is high
+and the host-out FIFO is empty. At that point every spike of UPDATE(t) has
+already gone to the host, so it is exact and needs no timeout. Typically
+this is 4 to 10 cycles after `step_done`. The old idle timer is still
+available as a fallback: set `DRAIN_CYCLES` > 0 on `spikemesh_0`.
 
 The FPGA build uses `fpga/rtl/sram_1r1w_fpga.sv` in place of
 `rtl/core/sram_1r1w.sv`. The ports are identical. The only change is that
@@ -54,11 +63,14 @@ cd fpga/vivado
 vivado -mode batch -source build.tcl -tclargs 2 2 0          # 2x2 mesh, AXI DMA host path
 vivado -mode batch -source build.tcl -tclargs 4 4 0          # 4x4 mesh
 vivado -mode batch -source build.tcl -tclargs 2 2 1 921600   # host path = PMOD UART at reset
+vivado -mode batch -source build.tcl -tclargs 4 4 0 921600 1 2   # 4x4, core (0,0) with R-STDP
 ```
 
-The arguments are `MESH_X MESH_Y HOST_SEL_RST BAUD`, and the defaults are
-`2 2 0 921600`. A 2x2 build should take tens of minutes. The outputs go to
-`build_<X>x<Y>/`:
+The arguments are `MESH_X MESH_Y HOST_SEL_RST BAUD LEARN_MASK LEARN_MODE`,
+and the defaults are `2 2 0 921600 0 1`. `LEARN_MASK` is a decimal number,
+32 bits at most. A 2x2 build should take tens of minutes. The outputs go to
+`build_<X>x<Y>/`, or to `build_<X>x<Y>_learn<mask>m<mode>/` for a learning
+build:
 
 | File | Use |
 |---|---|
@@ -147,25 +159,39 @@ W_BITS = 8 and FANOUT_DEPTH = 1024. The KV260 (XCK26) has 117 120 LUTs,
 results will differ: expect fewer LUTs, and possibly different BRAM and
 LUTRAM choices.
 
-| Build | Logic LUTs | FFs | LUTRAM (RAM32M16 / RAM64M8) | BRAM36 equivalent (RAMB36 + RAMB18/2), of 144 | URAM288, of 64 | DSP | Fits? |
+SPEC v0.2 RTL, with the URAM memory (`sram_1r1w_fpga`), which is the default. Bold marks the budget that limits each build.
+
+| Build | Logic LUTs, of 117 120 | FFs | LUTRAM (RAM32M16 / RAM64M8) | BRAM36 equivalent (RAMB18/2), of 144 | URAM288, of 64 | DSP | Fits? |
 |---|---|---|---|---|---|---|---|
-| 2x2, plain `sram_1r1w` (BRAM only) | 9 558 | 5 061 | 160 / 18 | **74** (64 + 20/2) | 0 | 0 | yes |
-| 2x2, `sram_1r1w_fpga` (URAM) | 9 588 | 5 101 | 160 / 18 | **10** | **8** | 0 | yes |
-| 4x4, plain `sram_1r1w` (BRAM only) | 42 490 | 18 821 | 680 / 66 | **296** (256 + 80/2) | 0 | 0 | **no: needs 206 % of the BRAM** |
-| 4x4, `sram_1r1w_fpga` (URAM), **the default** | 43 390 | 19 009 | 680 / 66 | **40** (28 %) | **32** (50 %) | 0 | yes, at 37 % of the LUTs |
-| 2x2 URAM, every core LEARN=1 (a local edit of `neurocore.sv`) | 31 171 | 8 065 | 192 / 50 | 10 | 8 | 34 | yes |
+| 2x2, inference | 13 249 (11 %) | 5 804 | 188 / 18 | 12 | 8 | 0 | yes |
+| 4x4, inference | **55 536 (47 %)** | 20 468 | 740 / 66 | 48 (33 %) | 32 (50 %) | 0 | yes |
+| 4x4, core (0,0) STDP (`LEARN_MASK=1 LEARN_MODE=1`) | **62 021 (53 %)** | 21 462 | 748 / 74 | 48 | 32 | 10 | yes |
+| 4x4, core (0,0) R-STDP (`LEARN_MASK=1 LEARN_MODE=2`) | **64 526 (55 %)** | 21 496 | 748 / 74 | 48 | 36 | 24 | yes |
 
-Each core's 64 K x 8 weight memory takes 2 URAM288 or 16 RAMB36. The
-fan-out table and the neuron state take 5 RAMB18. The NoC FIFOs map to
-LUTRAM.
+Each core's memories map as follows:
 
-LEARN=1 adds about 5 400 LUTs and 8 to 9 DSPs per core. The SG6 single-core
-synth agrees: LEARN=1 is 7 653 LUTs and 10 DSPs, against 1 625 LUTs
-for an inference core. At that rate, a 4x4 mesh with all cores learning
-would come to roughly 130 k LUTs in Yosys, which is over the KV260's 117 k.
-Vivado usually maps logic more tightly, but plan on learning in only some
-of the cores, or on a 3x3 or smaller mesh, until there is a Vivado number.
-LEARN=2 adds trace memory: 32 RAMB36 per core in the SG6 BRAM build.
+| Memory | Maps to |
+|---|---|
+| 64 K x 8 weights | 2 URAM288 |
+| Fan-out table, neuron state, and the v0.2 theta_a | 6 RAMB18 |
+| R-STDP eligibility (1 Mbit) | 4 URAM288 |
+| NoC FIFOs | LUTRAM |
+
+v0.1 used 43 390 LUTs and 40 BRAM36 for the 4x4 inference build; the
+growth since then is v0.2 (adaptive threshold, new registers) plus the
+rtl/top and rtl/noc updates.
+
+**How many learning cores fit:** each STDP core costs about 6.5 k LUTs and
+each R-STDP core about 9 k. In Yosys numbers, a 4x4 mesh therefore has room
+for about 9 STDP cores or 6 R-STDP cores. Vivado usually maps logic more
+tightly than Yosys, so this is a lower bound.
+
+Without the URAM memory (with plain `rtl/core/sram_1r1w.sv`), each core's
+weights take 16 RAMB36. A 4x4 mesh then needs about 300 BRAM36, more than
+the KV260's 144, so it does not fit (measured at v0.1: 296).
+
+The memory budget is not what limits the URAM builds. BRAM sits at 33 %, and
+URAM goes up by only 4 per R-STDP core.
 
 ## If timing fails
 
@@ -192,10 +218,9 @@ If timing fails, try these in order:
   CONFIG keys were written conservatively, but Vivado versions differ. If
   `bd.tcl` stops on a property, open the BD in the GUI. Then run
   `report_property [get_bd_cells zynq_ps]` and fix the name.
-* **Drain window.** STEP_DONE is sent after `host_out` has been idle for
-  `DRAIN_CYCLES` (64) cycles following `step_done`. This assumes that no
-  host-bound spike is in flight in the mesh for longer than that. That
-  holds for meshes up to 4x4 without heavy congestion. Raise
-  `DRAIN_CYCLES` if spikes ever show up a step late.
-* **LEARN.** `spikemesh_top` doesn't expose `LEARN`, so FPGA builds have
-  inference cores only.
+* **Drain.** STEP_DONE waits for `spikemesh_top`'s `drained`, as described
+  above. If a future chip drops that signal, build with `DRAIN_CYCLES` > 0
+  to use the idle-timer fallback. The timer assumes no host-bound spike
+  stays in the mesh for longer than that many cycles.
+* **Learning cores.** The host programs learning registers through CFG
+  flits, as in simulation. Size the mask using the LUT figures below.

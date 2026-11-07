@@ -13,8 +13,10 @@ module kv260_top_wrap #(
     parameter LANES        = 8,
     parameter CLK_HZ       = 100000000,
     parameter BAUD         = 921600,
-    parameter DRAIN_CYCLES = 64,
-    parameter HOST_SEL_RST = 0
+    parameter DRAIN_CYCLES = 0,   // 0: use spikemesh_top drained; > 0: idle-timer fallback
+    parameter HOST_SEL_RST = 0,
+    parameter LEARN_MASK   = 0,   // bit y*MESH_X+x: that core gets learning hardware
+    parameter LEARN_MODE   = 1    // 1 STDP, 2 STDP + R-STDP
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 clk CLK" *)
     (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axi:s_axis:m_axis, ASSOCIATED_RESET rst_n, FREQ_HZ 100000000" *)
@@ -58,7 +60,8 @@ module kv260_top_wrap #(
     kv260_top #(
         .MESH_X(MESH_X), .MESH_Y(MESH_Y), .N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS),
         .W_BITS(W_BITS), .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES), .CLK_HZ(CLK_HZ),
-        .BAUD(BAUD), .DRAIN_CYCLES(DRAIN_CYCLES), .HOST_SEL_RST(HOST_SEL_RST)
+        .BAUD(BAUD), .DRAIN_CYCLES(DRAIN_CYCLES), .HOST_SEL_RST(HOST_SEL_RST),
+        .LEARN_MASK(LEARN_MASK), .LEARN_MODE(LEARN_MODE)
     ) u_top (
         .clk(clk), .rst_n(rst_n),
         .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(s_axis_tready), .s_axis_tdata(s_axis_tdata),
