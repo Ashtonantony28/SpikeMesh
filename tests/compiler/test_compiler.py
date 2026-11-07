@@ -197,8 +197,12 @@ def test_every_cfg_flit_decodes_to_valid_core_and_region():
                 assert s is not None and n < s.n
         elif region == 2:
             assert s is not None and (low >> 1) < depth
+        elif (low >> 16) == 6:                       # v0.2 debug space 6: theta_a[n] = 0
+            assert s is not None and (low & 0xFFFF) < s.n and d["data"] == 0
         else:
-            assert low in (0, 1, 2, 3, 4, 8)
+            assert low in (0, 1, 2, 3, 4, 8, 23, 24, 25)
+            if low in (23, 24, 25):
+                assert d["data"] == 0
     assert seen_cores == {(x, y) for x in range(3) for y in range(3)}
     for c, s in place_of.items():
         assert regions[c] == {0, 1, 2, 3}
@@ -219,3 +223,26 @@ def test_sparse_weights_and_init_unused_options():
 
 def test_snake_order():
     assert _snake(3, 2) == [(0, 0), (1, 0), (2, 0), (2, 1), (1, 1), (0, 1)]
+
+
+def test_v02_adaptive_state_is_neutralised():
+    """SPEC v0.2: theta_a is an undefined neuron memory and regs 23-25 may hold junk;
+    the compiled image writes them to 0, so the golden chip still equals reference_run."""
+    rng = np.random.default_rng(77)
+    net = rand_net(rng, [24, 30, 12])
+    prog = compile_net(net, 2, 2, 16, 32)
+    backend = GoldenBackend.for_program(prog)
+    for k in backend.chip.cores.values():
+        k.theta_a[:] = rng.integers(0, 65536, k.N)
+        k.set_reg("th_inc", 500)
+        k.set_reg("th_decay_shift", 3)
+        k.set_reg("plastic_axon_max", 7)
+    host = SpikeMeshHost(backend)
+    host.load(prog)
+    for (x, y), s in {(s.x, s.y): s for s in prog.slices}.items():
+        k = backend.chip.cores[(x, y)]
+        assert (k.theta_a[: s.n] == 0).all()
+        assert (k.regs.th_inc, k.regs.th_decay_shift, k.regs.plastic_axon_max) == (0, 0, 0)
+    inputs = rng.random((30, 24)) < 0.3
+    out, rasters = host.run(inputs, probes=True)
+    np.testing.assert_array_equal(out, reference_run(net, inputs)[-1])

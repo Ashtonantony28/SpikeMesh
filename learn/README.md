@@ -1,138 +1,136 @@
-# On-chip learning experiments (golden model, bit-exact)
+# On-chip learning experiments (golden model, SPEC v0.2, bit-exact)
 
-Every weight change in these experiments comes from the SPEC §6 STDP / R-STDP
-logic running inside `golden.spikemesh.Chip`. After setup, the host only
-injects events, sends REWARD packets, writes core registers or neuron `v`/`bias`
-(CFG writes), and reads output spikes. It never writes a weight. Anything not
-in SPEC v0.1 is a clearly flagged prototype in `learn/`, never a change to `golden/`.
+Every weight change in these experiments comes from the SPEC §6/§9 STDP and
+R-STDP logic running inside `golden.spikemesh.Chip` (`SPEC_VERSION = "0.2"`).
+After setup, the host only injects events, sends REWARD packets, writes core
+registers and neuron `v`/`bias`, and reads output spikes. It never writes a weight.
 
 | File | What |
 |---|---|
 | `stdp_unsupervised.py` | Diehl & Cook-style unsupervised STDP on emulated N-MNIST |
 | `rstdp_adapt.py` | Learning a held-out digit class on the chip with R-STDP and host REWARD packets |
-| `../tests/learn/` | 28 tests, ~14 s: golden speed-up equivalence, pinned small versions of both experiments, the SPEC findings |
+| `../tests/learn/` | 31 tests, ~20 s: golden LEARN speed-up equivalence, pinned small versions of both experiments |
+| `../tests/golden/test_v02.py` | the five SPEC v0.2 rules, plus the new register and debug-space map |
 
-Golden speed-up (`golden/spikemesh.py`, no semantic change): `LFSR16.take` now
-slices a cached copy of the full 65535-state cycle, and LEARN steps 2 and 3
-handle all flagged rows or columns in one vectorised call, drawing LFSR values in
-the same order. `tests/learn/test_golden_speedup.py` keeps the original loops as
-reference functions. It checks that the LFSR sequences match (several seeds, up to 70 000
-draws), and that weights, eligibility, traces, v, refc, LFSR state and output spikes match after every
-step for 10 random STDP and R-STDP scenarios. On a 256 × 256 core with 40
+Golden speed-up (pure refactor): `LFSR16.take` slices a cached copy of the 65535-state
+cycle, and LEARN steps 2 and 3 handle all flagged rows or columns in one vectorised call. `tests/learn/test_golden_speedup.py`
+compares this against a reference with one loop iteration per row/column and one `next()` per draw.
+That reference now includes the v0.2 rules. It checks equality after every step in 16 random STDP and R-STDP
+scenarios that also exercise `plastic_axon_max` and the adaptive threshold. On a 256 × 256 core with 40
 presynaptic and 10 postsynaptic spikes per step, LEARN went from 2.1 ms to 0.59 ms.
 
 ## 1. Unsupervised STDP (`stdp_unsupervised.py`)
 
-**Mapping (one core).** The input uses axons 0..246: the 247 most active pixels
-of the 16 × 16 input. The host drops the 9 least active border pixels, because a 16 × 16 input
-uses all 256 axons. Axons 247..255 are 9 inhibitory axons. Each of the
-100 excitatory neurons has 9 fan-out entries to those axons of its own core,
-plus one to the host (100 × 10 = 1000 ≤ 1024 fan-out entries). Inhibitory
-weights start at −128, so lateral inhibition lands one timestep after a spike.
+**Mapping (one core).** The input uses axons 0..P−1, the P most active pixels. The host
+drops the 256−P least active border pixels, because a 16 × 16 input uses all
+256 axons. The remaining k = 256−P axons are inhibitory, with weights fixed at −128 by
+`plastic_axon_max = P` (§9 rule 3). Every excitatory neuron fans out to all k
+of them in its own core, plus one entry to the host (n × (k+1) ≤ 1024 fan-out entries), which gives
+lateral inhibition one step later. An option with two cores and a separate inhibitory core (`--inh core`)
+also exists.
 
-**Host schedule.** A plain STDP run collapses: weights either run away to
-`w_max` or all decay to `w_min`. So each sample uses a two-phase register
-schedule. Phase 1 is the pattern: 24 timesteps with `a_minus = 0`, so only
-Hebbian potentiation happens. Phase 2 is the complement: one timestep with `theta = 32767`
-and `a_plus = 0`. In it, the host injects events on every pixel that stayed silent and on the
-inhibitory axons. "Pre after post" then depresses exactly the recent winners'
-weights on pixels outside the pattern. This is Diehl & Cook's (x_pre − x_tar)
-normalisation, done by on-chip STDP. After the sample, the host writes v = 0, runs one drain step, and
-writes v = 0 again.
+**Host schedule per sample.** In the pattern phase (24 steps), `a_minus = 0`. In the complement phase (1 step),
+`theta = 32767` and `a_plus = 0`, and the host sends events on every pixel that stayed silent, so the
+recent winners are depressed on pixels outside the pattern. Diehl & Cook's normalisation is thus done by
+on-chip STDP. Then v = 0, one drain step, and v = 0 again. The adaptive threshold (§9 rule 4:
+`th_inc`, `th_decay_shift`) is active while learning. For labelling and test the host writes both
+registers to 0, which freezes `theta_a`, and optionally lowers the base `theta` (`--test-theta`).
 
-**Results.** 100 excitatory neurons, one pass over 3 000 training samples,
-neurons labelled on 1 000 separate training samples, scored on 1 000 test
-samples. Each run takes about 1.4 min.
+**Results.** One pass over 3 000 training samples, neurons labelled on 1 000 other training
+samples, scored on 1 000 test samples. Each run takes about 0.8 min.
 
-| Variant | SPEC | Test acc | Notes |
+| Golden | Variant | Neurons | Test acc |
 |---|---|---|---|
-| SPEC v0.1 only | yes | **12.6 %** | 87 of 100 neurons never fire; the 13 that do respond to everything |
-| + trace-decay fix (prototype) | **no** | 31.5 % | 94 neurons labelled, all 10 classes covered |
-| + trace fix + adaptive threshold (prototype) | **no** | **40.9 %** | `theta_plus` 200, decay shift 10 |
+| v0.1 *(history, commit adff334)* | SPEC v0.1 only | 100 | 12.6 % |
+| v0.1 *(history)* | + trace-decay fix prototype | 100 | 31.5 % |
+| v0.1 *(history)* | + trace fix + adaptive-threshold prototype | 100 | 40.9 % |
+| **v0.2** | decay floor + fixed inhibition (`plastic_axon_max`), no adaptive threshold | 100 | 33.8 % |
+| **v0.2** | + adaptive threshold (`th_inc` 200, decay shift 10) | 100 | 43.1 % |
+| **v0.2** | + `th_inc` 400, decay shift 12, k = 4, `test_theta` 1500 | 200 | **60.4 %** (seed 0), 57.5 % (seed 1) |
 
-**The 85 % target was not reached.** Two reasons:
+Ceiling for prototype learning on this encoding: non-spiking cosine k-means on per-pixel
+event counts gets 77.5 % with 100 prototypes, **82.1 % with 200** and 83.7 % with 400.
+So the best chip result is about 22 percentage points below the ideal learner with the same number of
+neurons, and the 85 % target is above even the ideal at ≤ 256 neurons.
 
-1. *The encoding limits even ideal prototype learning.* These numbers are non-spiking float
-   baselines on per-pixel event counts of the same data. Cosine k-means gets 77.5 % with 100
-   prototypes and 83.7 % with 400. Cosine class means get 68.9 %. A plain dot product with
-   class means gets 17.6 %. So per-neuron weight normalisation is essential, and
-   ≥ 85 % would need more than 256 neurons even in the ideal case. Hand-placed class
-   templates loaded onto the chip with learning off got only 20–35 %, because
-   one-step-delayed inhibition and saturating counts give a poor winner-take-all.
-2. *SPEC findings, below.* The trace-decay floor and the lack of homeostasis
-   are what separate rows 1, 2 and 3 above.
+What I tried within about 40 min of compute:
+* **Stronger homeostasis helps most.** Raising `th_inc` from 200 to 400 (decay shift 12) took
+  100 neurons from 43 % to 55 %.
+* **More neurons help.** 200 neurons with k = 4 inhibitory axons gave 57.5 %.
+* **Lowering the base threshold at test helps.** Spikes are sparse (7–15 per sample); with
+  `test_theta` 1500 the readout improves to 60 %.
+* **Did not help:**
+  * longer training (10 000 samples: 48–53 %);
+  * slower learning (`stdp_shift` 9 or 10: 54–56 %);
+  * refractory period 2 (54 %);
+  * stronger `a_plus` / `a_minus` (58 %);
+  * a smaller initial weight spread (58 %);
+  * two cores of 128 neurons with an inhibitory core (27 %): the extra hop delays inhibition to t+2,
+    so many neurons fire per sample (220 spikes).
 
-Commands (results in `runs/learn/*.json`):
+The remaining gap looks structural. Inhibition is delayed by one step, and the network has
+no per-neuron weight normalisation, only the complement-phase approximation.
+
+Reproduce (results in `runs/learn/v02_*.json`):
 ```
-C="--n-train 3000 --n-label 1000 --n-test 1000 --tau-pre-shift 1 --stdp-shift 8 --refrac 4 --w-init-max 30 --theta 3000 --v-min -3000 --a-plus 2"
-python -m learn.stdp_unsupervised $C --tau-post-shift 3 --inc-post 128 --a-minus 4 --out runs/learn/stdp_spec.json
-python -m learn.stdp_unsupervised $C --tau-post-shift 1 --inc-post 255 --a-minus 48 --trace-fix 1 --out runs/learn/stdp_tracefix.json
-python -m learn.stdp_unsupervised $C --tau-post-shift 1 --inc-post 255 --a-minus 16 --trace-fix 1 --adaptive 1 --theta-plus 200 --theta-decay-shift 10 --out runs/learn/stdp_tracefix_adaptive.json
+python -m learn.stdp_unsupervised --out runs/learn/v02_stdp_base.json
+python -m learn.stdp_unsupervised --a-minus 16 --th-inc 200 --th-decay-shift 10 --out runs/learn/v02_stdp_adaptive.json
+B="--a-minus 16 --th-inc 400 --th-decay-shift 12 --n-exc 200 --k-inh 4 --test-theta 1500"
+python -m learn.stdp_unsupervised $B --out runs/learn/v02_stdp_best_s0.json
+python -m learn.stdp_unsupervised $B --seed 1 --lfsr-seed 4660 --out runs/learn/v02_stdp_best_s1.json
 ```
 
 ## 2. On-device adaptation with R-STDP (`rstdp_adapt.py`)
 
-1. The host trains a 256→256→10 network with QAT (3 epochs, `train/model.py`) on emulated N-MNIST
-   **without class 9**. Training takes 3 min and the result is cached in `runs/learn/holdout9.npz`.
+1. The host trains a 256→256→10 network with QAT (3 epochs) on emulated N-MNIST **without class 9**
+   (`runs/learn/holdout9.npz`).
 2. On the chip: the hidden layer is core (0,0), the frozen output layer is core (1,0), and every hidden
-   neuron also fans out to the adaptation core (1,1). Neuron 0 of that core is the new
-   class head: weights 0, R-STDP enabled, `a_minus = 0`, and a bias of 170 so that it fires
-   a little on any input (exploration).
-3. After each sample the host sends one REWARD packet. The reward depends on the
-   output spikes the host has just read (decision mode):
-   * class-9 sample: +32, unless the head already beats the best old neuron by 4;
-   * other sample: −24 only if the head would win, otherwise 0.
+   neuron also fans out to core (1,1). Neuron 0 of that core is the new class head: weights 0,
+   R-STDP enabled, `a_minus = 0`, and a bias of 170 so that it fires a little on any input.
+3. After each sample the host sends one REWARD packet, decided from the output spikes it has just read:
+   * class-9 sample: +32, unless the head already wins by 4;
+   * other sample: −24 if the head would win, otherwise 0.
 
-   Twelve silent drain steps let eligibility decay (`tau_elig_shift = 3`). After
-   adaptation, the host writes the head's bias to 0, a neuron-parameter write that turns exploration off.
-4. Readout: the old neuron for class 9 is ignored and the head stands in for it.
+   Twelve silent drain steps follow (`tau_elig_shift` 3). After adaptation, the host writes the head's
+   bias to 0. For readout, the head stands in for the untrained class-9 neuron.
 
-The adaptation stream is 1 000 training samples, half class 9. The test set is 1 000
-balanced test samples (500 class 9 / 500 other). Each run takes 0.5 min.
+The adaptation stream is 1 000 training samples, half class 9; the test set is 1 000 balanced test
+samples. Each run takes 0.5 min.
 
-| Seed | New class before → after | Old classes before → after |
-|---|---|---|
-| 0 | 0 % → **96.0 %** | 97.4 % → 89.6 % |
-| 1 | 0 % → **98.6 %** | 96.4 % → 72.0 % |
+| Golden | Seed | New class before → after | Old classes before → after |
+|---|---|---|---|
+| v0.1 *(history)* | 0 | 0 % → 96.0 % | 97.4 % → 89.6 % |
+| v0.1 *(history)* | 1 | 0 % → 98.6 % | 96.4 % → 72.0 % |
+| **v0.2** | 0 | 0 % → **95.6 %** | 97.4 % → 87.4 % |
+| **v0.2** | 1 | 0 % → **99.4 %** | 96.4 % → 55.4 % |
+| **v0.2** | 2 | 0 % → **96.0 %** | 96.2 % → 85.0 % |
 
-The new class is learned reliably. How much accuracy the old classes keep varies a lot between seeds, because
-the head steals some old-class samples. The method is fragile:
-* With reward by label alone (+ for class 9, − for all others), the head dies in
-  every setting tried. Its weights go negative, it stops firing, and it never recovers.
-* Changing the margin from 4 to 2 with a −32 reward also kills it.
-* In the pinned small test, one of three stream seeds ends with a dead head.
+The new class is always learned. How much accuracy the old classes keep still depends on the
+sample order: in seed 1 the head keeps firing on old-class samples.
 
-The cause is the reward-rounding asymmetry below, plus the fact that no
-eligibility can form without a postsynaptic spike.
+Rounded reward (§9 rule 2) made learning more robust. In the small pinned test, stream seed 1 used to end with a dead head
+under v0.1, and now all five stream seeds learn. It did not fix forgetting of the old classes.
+Increasing the negative reward to −32 or −40 changed old-class accuracy by only a few points
+(seed 1: 63–70 %). Reward-by-label alone (+ for class 9, − for everything else) still drives the head's weights negative.
 
 ```
-python -m learn.rstdp_adapt --seed 0 --out runs/learn/rstdp_seed0.json
-python -m learn.rstdp_adapt --seed 1 --out runs/learn/rstdp_seed1.json
+python -m learn.rstdp_adapt --seed 0 --out runs/learn/v02_rstdp_seed0.json   # seeds 1, 2 likewise
 ```
 
-## SPEC findings (for an ADR; nothing was changed)
+## SPEC history
 
-1. **Traces never decay to zero (§6 step 1).** `x -= x >> k` has fixed points
-   1..2^k−1. Every synapse whose neuron ever spiked keeps a permanent trace
-   floor, so with stochastic rounding every later pre or post event causes background
-   depression or potentiation. In unsupervised STDP this slowly kills every neuron that has
-   ever fired. Fix: decay by `max(1, x >> k)` while `x > 0`
-   (prototype `--trace-fix`, which gives +18.9 pp). Pinned by
-   `test_spec_trace_decay_never_reaches_zero`.
-2. **Reward rounding is biased (§6 R-STDP).** `(r * e) >>> reward_shift` rounds
-   toward −∞. A small positive product gives 0, a small negative one gives −1, so weak
-   eligibility only ever gets depressed. Suggested fix: round to nearest, or use the LFSR's
-   stochastic rounding (`sr`). Pinned by `test_reward_rounding_is_floor`.
-3. **No per-axon plasticity mask.** In a learning core, recurrent inhibitory
-   synapses are plastic too. Here the inhibitory weights stayed within
-   [−128, −123] because inhibition follows the spike, but potentiation-heavy settings
-   turned them excitatory (up to +119), and the network ran away. Suggested fix: a
-   `plastic_axon_max` core register.
-4. **No homeostasis.** A per-neuron adaptive threshold (prototype `--adaptive`:
-   +`theta_plus` per spike, `>> theta_decay_shift` decay) adds 9.4 pp on top of the trace fix.
-   This is a proposed SPEC extension with a prototype only.
-5. **Rewards sent while R-STDP is off.** The golden model keeps `pending_reward` when `rstdp_en = 0` or
-   `learn_en = 0`, and applies it whenever R-STDP is next switched on. The SPEC says nothing about
-   this case; it should say whether such rewards are discarded.
-6. **Axon budget.** A 16 × 16 input uses every one of the 256 axons, which leaves none for
-   inhibition, so the STDP mapping drops 9 pixels.
+The v0.1 findings from these experiments became SPEC v0.2 §9 (ADR-007), implemented in
+`golden/spikemesh.py` and pinned in `tests/golden/test_v02.py`:
+
+1. decay floor `x -= max(1, x >> k)`;
+2. rounded reward;
+3. `plastic_axon_max` (reg 23);
+4. per-neuron adaptive threshold `theta_a` (regs 24/25, debug space 6);
+5. rewards dropped while learning is off.
+
+The compiler writes regs 23–25 = 0 and `theta_a` = 0 for every used neuron, so compiled
+inference networks behave exactly as before.
+
+Open observations, not SPEC changes:
+* Lateral inhibition costs fan-out (n × (k+1) ≤ 1024) and pixel axons, because the 16 × 16 input fills all 256 axons.
+* Inhibition through a separate core arrives one step later still, which breaks winner-take-all.

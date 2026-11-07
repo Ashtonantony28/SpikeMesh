@@ -28,6 +28,14 @@ HOST_X = F.HOST_X
 MAX_FANOUT_COUNT = 63          # count field of the fan-out pointer is 6 bits (§5)
 REG_THETA, REG_LEAK, REG_RESET, REG_REFRAC, REG_VMIN, REG_LEARN_EN = 0, 1, 2, 3, 4, 8
 FIELD_V, FIELD_BIAS, FIELD_REFC, FIELD_PTR = 0, 1, 2, 3
+# SPEC v0.2 §9: plastic_axon_max, adaptive threshold increment / decay
+REG_PLASTIC_AXON_MAX, REG_TH_INC, REG_TH_DECAY = 23, 24, 25
+DBG_THETA_A = 6                # region 11 debug space 6: theta_a[n] (§5, §9 rule 4)
+
+
+def addr_theta_a(neuron: int) -> int:
+    """Region 11, debug space 6, index n (SPEC §5/§9)."""
+    return (3 << 20) | (DBG_THETA_A << 16) | (neuron & 0xFFFF)
 
 
 class CompileError(ValueError):
@@ -81,12 +89,13 @@ class Program:
         return {(s.x, s.y): s for s in self.slices}
 
     def state_reset_flits(self) -> list[int]:
-        """CFG writes that set v = 0 and refc = 0 for every used neuron."""
+        """CFG writes that set v = 0, refc = 0 and theta_a = 0 for every used neuron."""
         out = []
         for s in self.slices:
             for n in range(s.n):
                 out.append(F.cfg_write(s.x, s.y, F.addr_neuron(n, FIELD_V), 0))
                 out.append(F.cfg_write(s.x, s.y, F.addr_neuron(n, FIELD_REFC), 0))
+                out.append(F.cfg_write(s.x, s.y, addr_theta_a(n), 0))
         return out
 
     def pointer_flits(self, silence: bool = False) -> list[int]:
@@ -370,6 +379,10 @@ def compile_net(net: NetIR, mesh_x: int, mesh_y: int, n_neurons: int = 256, n_ax
         cw(F.addr_reg(REG_REFRAC), L.refrac)
         cw(F.addr_reg(REG_VMIN), L.v_min)
         cw(F.addr_reg(REG_LEARN_EN), 0)
+        # v0.2: no adaptive threshold, every axon plastic (learning is off anyway)
+        cw(F.addr_reg(REG_PLASTIC_AXON_MAX), 0)
+        cw(F.addr_reg(REG_TH_INC), 0)
+        cw(F.addr_reg(REG_TH_DECAY), 0)
         # fan-out entry list for this layer (same for every neuron)
         if s.layer == n_layers - 1:
             dests = [(HOST_X, 0, None)]
@@ -383,6 +396,7 @@ def compile_net(net: NetIR, mesh_x: int, mesh_y: int, n_neurons: int = 256, n_ax
             cw(F.addr_neuron(n, FIELD_V), 0)
             cw(F.addr_neuron(n, FIELD_BIAS), int(L.bias[g]))
             cw(F.addr_neuron(n, FIELD_REFC), 0)
+            cw(addr_theta_a(n), 0)          # theta_a is a neuron memory, undefined at reset
             base = n * c
             cw(F.addr_neuron(n, FIELD_PTR), (c << 10) | base)
             for k, (dx, dy, kind) in enumerate(dests):

@@ -1,4 +1,8 @@
-"""The golden LFSR / LEARN speed-up is a pure refactor: identical to the original loops."""
+"""The golden LFSR / LEARN speed-up is a pure refactor: identical to straightforward loops.
+
+The reference follows SPEC v0.2 (§6 + §9) with one loop per row / column and
+one LFSR next() per draw, i.e. the original implementation plus the v0.2 rules.
+"""
 import numpy as np
 import pytest
 
@@ -14,7 +18,7 @@ def ref_take(lfsr: LFSR16, k: int) -> np.ndarray:
 
 
 def ref_learn(self: Core):
-    """Original Core.learn (per-row / per-column loops, loop LFSR)."""
+    """Reference Core.learn: per-row / per-column loops, loop LFSR, SPEC v0.2."""
     R = self.regs
     if not R.learn_en:
         return
@@ -27,16 +31,24 @@ def ref_learn(self: Core):
         mask = (1 << s) - 1
         return (m >> s) + ((rnd & mask) < (m & mask)).astype(np.int64)
 
-    if R.tau_pre_shift:
-        self.x_pre -= self.x_pre >> R.tau_pre_shift
-    if R.tau_post_shift:
-        self.x_post -= self.x_post >> R.tau_post_shift
+    def decay(x, k):
+        out = x.copy()
+        if k:
+            for i in range(len(out)):
+                if out[i] > 0:
+                    out[i] -= max(1, int(out[i]) >> k)
+        return out
+
+    self.x_pre = decay(self.x_pre, R.tau_pre_shift)
+    self.x_post = decay(self.x_post, R.tau_post_shift)
     if R.rstdp_en:
         if R.tau_elig_shift:
             self.elig -= self.elig >> R.tau_elig_shift
         if self.pending_reward:
-            dw = (self.pending_reward * self.elig) >> R.reward_shift
-            self.w = sat(self.w + dw, R.w_min, R.w_max)
+            re = self.pending_reward * self.elig
+            if R.reward_shift:
+                re = (re + (1 << (R.reward_shift - 1))) >> R.reward_shift
+            self.w = sat(self.w + re, R.w_min, R.w_max)
             self.pending_reward = 0
     target = self.elig if R.rstdp_en else self.w
     lo, hi = (-32768, 32767) if R.rstdp_en else (R.w_min, R.w_max)
@@ -45,10 +57,13 @@ def ref_learn(self: Core):
         target[a] = sat(target[a] - d, lo, hi)
     for n in np.flatnonzero(self.post_flag):
         d = sr(R.stdp_a_plus * self.x_pre)
-        target[:, n] = sat(target[:, n] + d, lo, hi)
-    self.x_pre[self.pre_flag] = np.minimum(self.x_pre[self.pre_flag] + R.inc_pre, 255)
+        for a in range(self.A):
+            if R.plastic_axon_max == 0 or a < R.plastic_axon_max:
+                target[a, n] = min(max(target[a, n] + d[a], lo), hi)
+    self.x_pre[self.pre_seen] = np.minimum(self.x_pre[self.pre_seen] + R.inc_pre, 255)
     self.x_post[self.post_flag] = np.minimum(self.x_post[self.post_flag] + R.inc_post, 255)
     self.pre_flag[:] = False
+    self.pre_seen[:] = False
     self.post_flag[:] = False
 
 
@@ -76,7 +91,8 @@ def _make_chip(core_cls, rng_seed, n=24, rstdp=False):
                 lfsr_seed=int(rng.integers(0, 65536)), w_min=int(rng.integers(-128, 0)),
                 w_max=int(rng.integers(1, 128)), theta=int(rng.integers(20, 200)),
                 tau_elig_shift=int(rng.integers(0, 6)), reward_shift=int(rng.integers(0, 8)),
-                leak_shift=2)
+                leak_shift=2, plastic_axon_max=int(rng.choice([0, 0, int(rng.integers(1, n))])),
+                th_inc=int(rng.integers(0, 30)), th_decay_shift=int(rng.integers(0, 5)))
     for name, v in regs.items():
         k.set_reg(name, v)
     k.w[:] = rng.integers(-40, 80, (n, n))
@@ -87,7 +103,7 @@ def _make_chip(core_cls, rng_seed, n=24, rstdp=False):
 
 
 @pytest.mark.parametrize("rstdp", [False, True])
-@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("seed", range(8))
 def test_learning_identical_to_reference(seed, rstdp):
     new, rng = _make_chip(Core, seed, rstdp=rstdp)
     ref, _ = _make_chip(RefCore, seed, rstdp=rstdp)
@@ -102,7 +118,7 @@ def test_learning_identical_to_reference(seed, rstdp):
                 c.reward(0, 0, int(rewards[t]))
         assert new.step() == ref.step()
         a, b = new.core(0, 0), ref.core(0, 0)
-        for f in ("w", "elig", "x_pre", "x_post", "v", "refc"):
+        for f in ("w", "elig", "x_pre", "x_post", "v", "refc", "theta_a"):
             np.testing.assert_array_equal(getattr(a, f), getattr(b, f), err_msg=f"{f} t={t}")
         assert a.lfsr.state == b.lfsr.state
     assert (new.core(0, 0).w != _make_chip(Core, seed)[0].core(0, 0).w).any(), "no learning happened"

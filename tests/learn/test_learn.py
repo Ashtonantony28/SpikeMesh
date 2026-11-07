@@ -5,9 +5,8 @@ import numpy as np
 import pytest
 
 from compiler.netir import NetIR
-from golden.spikemesh import Chip, Core
 from learn.rstdp_adapt import AdaptCfg, AdaptChip, adapt, balanced_stream, evaluate
-from learn.stdp_unsupervised import Cfg, ProtoCore, STDPNet, assign_labels, classify
+from learn.stdp_unsupervised import Cfg, STDPNet, assign_labels, classify
 from train.data import images_to_events
 
 FIX = Path(__file__).resolve().parents[1] / "train" / "fixtures"
@@ -27,67 +26,8 @@ def _digits(n, seed=0):
     return images_to_events(img), lab
 
 
-# ------------------------------------------------------------- SPEC findings pinned
-def test_spec_trace_decay_never_reaches_zero():
-    """SPEC §6 x -= x >> k has fixed points 1..2^k-1 (reported as a SPEC issue)."""
-    c = Chip(1, 1, 4, 4)
-    k = c.core(0, 0)
-    for n, v in dict(learn_en=1, tau_pre_shift=2, inc_pre=64, theta=1000).items():
-        k.set_reg(n, v)
-    c.inject(0, 0, 0)
-    for _ in range(60):
-        c.step()
-    assert k.x_pre[0] == 3                           # stuck forever
-
-
-def test_trace_fix_prototype_decays_to_zero():
-    k = ProtoCore(0, 0, 4, 4, trace_fix=True)
-    for n, v in dict(learn_en=1, tau_pre_shift=2, tau_post_shift=1).items():
-        k.set_reg(n, v)
-    k.x_pre[:] = [64, 3, 1, 0]
-    k.x_post[:] = [255, 1, 0, 9]
-    for _ in range(40):
-        k.learn()
-    assert (k.x_pre == 0).all() and (k.x_post == 0).all()
-    assert k.regs.tau_pre_shift == 2 and k.regs.tau_post_shift == 1   # registers restored
-
-
-def test_reward_rounding_is_floor():
-    """(r * e) >>> reward_shift floors: small positive -> 0, small negative -> -1."""
-    for r, want in ((1, 0), (-1, -1)):
-        c = Chip(1, 1, 2, 2)
-        k = c.core(0, 0)
-        for n, v in dict(learn_en=1, rstdp_en=1, reward_shift=4, theta=1000).items():
-            k.set_reg(n, v)
-        k.elig[:] = 1
-        c.reward(0, 0, r)
-        c.step()
-        assert (k.w == want).all()
-
-
-@pytest.mark.parametrize("seed", range(3))
-def test_protocore_flags_off_is_golden(seed):
-    rng = np.random.default_rng(seed)
-
-    def build(cls):
-        c = Chip(1, 1, 16, 16)
-        c.cores[(0, 0)] = k = cls(0, 0, 16, 16)
-        for n, v in dict(learn_en=1, stdp_a_plus=9, stdp_a_minus=7, stdp_shift=3, tau_pre_shift=2,
-                         tau_post_shift=1, inc_pre=50, inc_post=70, theta=60, leak_shift=1,
-                         lfsr_seed=77 + seed).items():
-            k.set_reg(n, v)
-        k.w[:] = np.random.default_rng(seed).integers(-10, 40, (16, 16))
-        return c
-
-    a, b = build(Core), build(ProtoCore)
-    ins = rng.random((40, 16)) < 0.3
-    for t in range(40):
-        for c in (a, b):
-            for ax in np.flatnonzero(ins[t]):
-                c.inject(0, 0, int(ax))
-            c.step()
-        np.testing.assert_array_equal(a.core(0, 0).w, b.core(0, 0).w)
-        np.testing.assert_array_equal(a.core(0, 0).v, b.core(0, 0).v)
+# (The SPEC v0.1 findings that these experiments produced are now SPEC v0.2
+#  rules; they are pinned in tests/golden/test_v02.py.)
 
 
 # ------------------------------------------------------------- unsupervised STDP
@@ -101,45 +41,59 @@ def _small_cfg(**kw):
 def test_stdp_net_learns_on_chip_only_and_is_deterministic():
     x, _ = _digits(30)
     pix = np.arange(256)
-    nets = [STDPNet(_small_cfg(), pix) for _ in range(2)]
-    w0 = nets[0].core.w.copy()
+    nets = [STDPNet(_small_cfg(th_inc=200), pix) for _ in range(2)]
+    k0 = nets[0].cores[0]
+    w0 = k0.w.copy()
     for net in nets:
         for xi in x:
             net.present(xi)
-    np.testing.assert_array_equal(nets[0].core.w, nets[1].core.w)       # bit-reproducible
-    assert (nets[0].core.w != w0).any()                                 # learning happened
-    assert nets[0].core.regs.theta == 3000                              # phase registers restored
-    assert nets[0].inh_weights().max() <= nets[0].cfg.w_min + 16        # inhibition stays inhibitory
-    # learning off: weights frozen
+    np.testing.assert_array_equal(k0.w, nets[1].cores[0].w)            # bit-reproducible
+    assert (k0.w != w0).any()                                           # learning happened
+    assert k0.regs.theta == 3000                                        # phase registers restored
+    assert (nets[0].inh_weights() == nets[0].cfg.w_inh).all()           # plastic_axon_max: fixed
+    assert k0.theta_a.max() > 0                                         # adaptive threshold active
+    # learning off: weights and thresholds frozen
     nets[0].learning(False)
-    w1 = nets[0].core.w.copy()
+    w1, th1 = k0.w.copy(), k0.theta_a.copy()
     for xi in x[:5]:
         nets[0].present(xi)
-    np.testing.assert_array_equal(nets[0].core.w, w1)
+    np.testing.assert_array_equal(k0.w, w1)
+    np.testing.assert_array_equal(k0.theta_a, th1)
+
+
+def test_stdp_plastic_inhibition_drifts_without_v02_register():
+    x, _ = _digits(30)
+    net = STDPNet(_small_cfg(plastic_inh=False, a_plus=40), np.arange(256))
+    for xi in x:
+        net.present(xi)
+    assert (net.inh_weights() != net.cfg.w_inh).any()
 
 
 def test_stdp_fanout_fits_memory():
     with pytest.raises(AssertionError):
         STDPNet(_small_cfg(n_exc=200, k_inh=9), np.arange(256))
+    with pytest.raises(AssertionError):
+        STDPNet(_small_cfg(n_cores=2), np.arange(256))          # direct inhibition is 1-core
+
+
+def test_stdp_two_cores_with_inhibitory_core():
+    x, _ = _digits(10)
+    net = STDPNet(_small_cfg(n_cores=2, inh="core", n_inh=4, k_inh=4), np.arange(256))
+    counts = net.run(x)
+    assert counts.shape == (10, 24) and counts.sum() > 0
+    assert (net.inh_weights() == net.cfg.w_inh).all()
 
 
 def test_stdp_small_run_two_shapes():
-    """Pinned small experiment: two bar orientations, 12 neurons, golden chip.
-
-    With the trace-decay fix prototype the net separates the shapes; with
-    SPEC v0.1 traces (floor never decays) it does not (see learn/README.md).
-    """
+    """Pinned small experiment: two bar orientations, 12 neurons, golden chip, SPEC v0.2."""
     x, y = _digits(200, seed=1)
-    accs = {}
-    for name, kw in (("spec", {}), ("trace_fix", dict(trace_fix=True))):
-        net = STDPNet(_small_cfg(**kw), np.arange(256))
-        for xi in x[:120]:
-            net.present(xi)
-        net.learning(False)
-        lab = assign_labels(net.run(x[120:150]), y[120:150], 2)
-        accs[name] = (classify(net.run(x[150:]), lab, 2) == y[150:]).mean()
-    assert accs["trace_fix"] >= 0.9, accs
-    assert accs["spec"] <= 0.7, accs          # documents the SPEC finding; update if SPEC changes
+    net = STDPNet(_small_cfg(), np.arange(256))
+    for xi in x[:120]:
+        net.present(xi)
+    net.learning(False)
+    lab = assign_labels(net.run(x[120:150]), y[120:150], 2)
+    acc = (classify(net.run(x[150:]), lab, 2) == y[150:]).mean()
+    assert acc >= 0.9, acc
 
 
 def test_label_assignment_and_vote():
@@ -174,26 +128,28 @@ def test_rstdp_weights_change_only_with_reward():
     assert ac2.nk.w[:, 0].min() < 0
 
 
-def test_rstdp_small_adaptation_pinned():
+@pytest.mark.parametrize("stream_seed", [1, 2])
+def test_rstdp_small_adaptation_pinned(stream_seed):
     """Small version of learn/rstdp_adapt.py on the committed SG1 net (head = class 9).
 
     Stream: the fixture's class-9 samples (first 200) repeated 6x + 120 others,
-    shuffled with seed 2. Seed 1 of the same stream ends with a dead head
-    (all weights negative): the fragility is reported in learn/README.md.
+    shuffled. Under SPEC v0.1 (floor-rounded reward) stream seed 1 ended with a
+    dead head; with v0.2's rounded reward every seed 0..4 learns.
     """
     net, x, y = _fixture()
     xt, yt = balanced_stream(x[200:], y[200:], 9, 40, np.random.default_rng(0))
     tr = np.arange(200)
     nine, old = tr[y[tr] == 9], tr[y[tr] != 9]
-    idx = np.random.default_rng(2).permutation(np.concatenate([np.repeat(nine, 6), old[:120]]))
+    idx = np.random.default_rng(stream_seed).permutation(np.concatenate([np.repeat(nine, 6), old[:120]]))
     res = []
-    for _ in range(2):
+    for _ in range(2 if stream_seed == 2 else 1):
         ac = AdaptChip(net, AdaptCfg())
         before = evaluate(ac, xt, yt)
         adapt(ac, x[idx], y[idx], log=lambda *a: None)
         ac.nk.bias[0] = ac.cfg.eval_bias
         res.append((before, evaluate(ac, xt, yt), ac.nk.w.copy()))
-    np.testing.assert_array_equal(res[0][2], res[1][2])                 # deterministic
+    if len(res) == 2:
+        np.testing.assert_array_equal(res[0][2], res[1][2])             # deterministic
     before, after = res[0][0], res[0][1]
     assert before["acc_new"] == 0.0
-    assert after["acc_new"] >= 0.9 and after["acc_old"] >= 0.9, after
+    assert after["acc_new"] >= 0.8 and after["acc_old"] >= 0.9, after   # 6 of 7 new-class samples

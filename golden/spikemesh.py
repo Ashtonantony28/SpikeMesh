@@ -1,4 +1,4 @@
-"""Integer golden model of the SpikeMesh chip (docs/SPEC.md v0.1).
+"""Integer golden model of the SpikeMesh chip (docs/SPEC.md v0.2).
 
 Timestep-exact, not cycle-exact. This is the oracle that the RTL and the
 PyTorch trainer are compared against. Every arithmetic step mirrors SPEC.md;
@@ -11,6 +11,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 HOST_X = 15
+SPEC_VERSION = "0.2"
+
+
+def decay_floor(x, k: int):
+    """SPEC §9 rule 1: x -= max(1, x >> k) when x > 0 and k > 0 (reaches 0)."""
+    if not k:
+        return x
+    return x - np.where(x > 0, np.maximum(x >> k, 1), 0)
 
 
 def sat(x, lo, hi):
@@ -87,6 +95,10 @@ class CoreRegs:
     rstdp_en: int = 0
     tau_elig_shift: int = 0
     reward_shift: int = 0
+    dbg_elig: int = 0            # reg 22 bit 0: region 00 accesses the eligibility memory
+    plastic_axon_max: int = 0    # §9 rule 3 (0 = every axon plastic)
+    th_inc: int = 0              # §9 rule 4
+    th_decay_shift: int = 0      # §9 rule 4
 
 
 REG_INDEX = {
@@ -94,7 +106,8 @@ REG_INDEX = {
     8: "learn_en", 9: "stdp_a_plus", 10: "stdp_a_minus", 11: "stdp_shift",
     12: "tau_pre_shift", 13: "tau_post_shift", 14: "inc_pre", 15: "inc_post",
     16: "lfsr_seed", 17: "w_min", 18: "w_max", 19: "rstdp_en",
-    20: "tau_elig_shift", 21: "reward_shift",
+    20: "tau_elig_shift", 21: "reward_shift", 22: "dbg_elig", 23: "plastic_axon_max",
+    24: "th_inc", 25: "th_decay_shift",
 }
 SIGNED_REGS = {"theta", "v_min", "w_min", "w_max"}
 
@@ -136,6 +149,10 @@ class Core:
         self.elig = np.zeros((n_axons, n_neurons), dtype=np.int64)
         self.pending_reward = 0
         self.lfsr = LFSR16(self.regs.lfsr_seed)
+        # §9 rule 3: arrivals on non-plastic axons bump x_pre but set no pre_flag
+        self.pre_seen = np.zeros(n_axons, dtype=bool)
+        # §9 rule 4: adaptive threshold (a neuron memory; golden starts it at 0)
+        self.theta_a = np.zeros(n_neurons, dtype=np.int64)
 
     # ---------------- configuration (§5) ----------------
     def set_reg(self, name: str, value: int):
@@ -155,6 +172,9 @@ class Core:
         low = addr & 0xFFFFF
         if region == 0:
             a, n = divmod(low, self.N)
+            if self.regs.dbg_elig & 1:
+                self.elig[a, n] = _s16(data)
+                return
             wmask = (1 << self.w_bits) - 1
             val = data & wmask
             if val & (1 << (self.w_bits - 1)):
@@ -180,17 +200,29 @@ class Core:
             else:
                 e.dest_axon = data & 0x3FF
         else:
-            r = low & 0xFF
-            if r in REG_INDEX:
-                name = REG_INDEX[r]
-                val = _s16(data) if name in SIGNED_REGS else data & 0xFFFF
-                self.set_reg(name, val)
+            sub, idx = (low >> 16) & 0xF, low & 0xFFFF
+            if sub == 0:
+                r = low & 0xFF
+                if r in REG_INDEX:
+                    name = REG_INDEX[r]
+                    val = _s16(data) if name in SIGNED_REGS else data & 0xFFFF
+                    if name == "dbg_elig":
+                        val &= 1
+                    self.set_reg(name, val)
+            elif sub == 1 and idx < self.A:
+                self.x_pre[idx] = data & 0xFF
+            elif sub == 2 and idx < self.N:
+                self.x_post[idx] = data & 0xFF
+            elif sub == 6 and idx < self.N:
+                self.theta_a[idx] = data & 0xFFFF
 
     def cfg_read(self, addr: int) -> int:
         region = (addr >> 20) & 3
         low = addr & 0xFFFFF
         if region == 0:
             a, n = divmod(low, self.N)
+            if self.regs.dbg_elig & 1:
+                return int(self.elig[a, n]) & 0xFFFF
             return int(self.w[a, n]) & 0xFFFF
         if region == 1:
             n, f = low >> 2, low & 3
@@ -200,17 +232,37 @@ class Core:
         if region == 2:
             e = self.fanout.get(low >> 1, FanoutEntry(0, 0, 0))
             return (e.dest_x << 12 | e.dest_y << 8) if (low & 1) == 0 else e.dest_axon
-        r = low & 0xFF
-        return int(getattr(self.regs, REG_INDEX[r])) & 0xFFFF if r in REG_INDEX else 0
+        sub, idx = (low >> 16) & 0xF, low & 0xFFFF
+        if sub == 0:
+            r = low & 0xFF
+            return int(getattr(self.regs, REG_INDEX[r])) & 0xFFFF if r in REG_INDEX else 0
+        if sub == 1:
+            return int(self.x_pre[idx]) if idx < self.A else 0
+        if sub == 2:
+            return int(self.x_post[idx]) if idx < self.N else 0
+        if sub == 3:
+            return int(self.pre_flag[idx]) if idx < self.A else 0
+        if sub == 4:
+            return int(self.post_flag[idx]) if idx < self.N else 0
+        if sub == 5:
+            pr = self.pending_reward & 0xFFFFFFFF
+            return [self.lfsr.state, pr & 0xFFFF, pr >> 16, 0][idx & 3]
+        if sub == 6:
+            return int(self.theta_a[idx]) & 0xFFFF if idx < self.N else 0
+        return 0
 
     # ---------------- runtime ----------------
     def receive_spike(self, axon: int, parity: int):
         self.acc[parity] += self.w[axon]
         if self.regs.learn_en:
-            self.pre_flag[axon] = True
+            self.pre_seen[axon] = True
+            pam = self.regs.plastic_axon_max
+            if pam == 0 or axon < pam:          # §9 rule 3
+                self.pre_flag[axon] = True
 
     def receive_reward(self, r: int):
-        self.pending_reward += r
+        if self.regs.learn_en and self.regs.rstdp_en:   # §9 rule 5: dropped while off
+            self.pending_reward += r
 
     def _sr(self, m: np.ndarray) -> np.ndarray:
         s = self.regs.stdp_shift
@@ -225,17 +277,17 @@ class Core:
         R = self.regs
         if not R.learn_en:
             return
-        # 1. trace decay (and eligibility decay)
-        if R.tau_pre_shift:
-            self.x_pre -= self.x_pre >> R.tau_pre_shift
-        if R.tau_post_shift:
-            self.x_post -= self.x_post >> R.tau_post_shift
+        # 1. trace decay with floor (§9 rule 1), eligibility decay (unchanged)
+        self.x_pre = decay_floor(self.x_pre, R.tau_pre_shift)
+        self.x_post = decay_floor(self.x_post, R.tau_post_shift)
         if R.rstdp_en:
             if R.tau_elig_shift:
                 self.elig -= self.elig >> R.tau_elig_shift
             if self.pending_reward:
-                dw = (self.pending_reward * self.elig) >> R.reward_shift
-                self.w = sat(self.w + dw, R.w_min, R.w_max)
+                re = self.pending_reward * self.elig
+                if R.reward_shift:                       # §9 rule 2: rounded
+                    re = (re + (1 << (R.reward_shift - 1))) >> R.reward_shift
+                self.w = sat(self.w + re, R.w_min, R.w_max)
                 self.pending_reward = 0
         target = self.elig if R.rstdp_en else self.w
         lo, hi = (-32768, 32767) if R.rstdp_en else (R.w_min, R.w_max)
@@ -249,11 +301,14 @@ class Core:
         cols = np.flatnonzero(self.post_flag)
         if cols.size:
             d = self._sr(np.tile(R.stdp_a_plus * self.x_pre, cols.size)).reshape(cols.size, self.A)
-            target[:, cols] = sat(target[:, cols] + d.T, lo, hi)
-        # 4. trace bumps
-        self.x_pre[self.pre_flag] = np.minimum(self.x_pre[self.pre_flag] + R.inc_pre, 255)
+            # §9 rule 3: draws for every axon, writes only to plastic ones
+            na = self.A if R.plastic_axon_max == 0 else min(self.A, R.plastic_axon_max)
+            target[:na, cols] = sat(target[:na, cols] + d.T[:na], lo, hi)
+        # 4. trace bumps (x_pre also for non-plastic axons, §9 rule 3)
+        self.x_pre[self.pre_seen] = np.minimum(self.x_pre[self.pre_seen] + R.inc_pre, 255)
         self.x_post[self.post_flag] = np.minimum(self.x_post[self.post_flag] + R.inc_post, 255)
         self.pre_flag[:] = False
+        self.pre_seen[:] = False
         self.post_flag[:] = False
 
     def update(self, parity: int) -> np.ndarray:
@@ -263,12 +318,15 @@ class Core:
         refr = self.refc > 0
         leak = (self.v >> R.leak_shift) if R.leak_shift else np.zeros_like(self.v)
         v2 = sat16(self.v - leak + sat16(acc) + self.bias)
-        spike = (~refr) & (v2 >= R.theta)
-        reset_v = (v2 - R.theta) if R.reset_mode == 0 else np.zeros_like(v2)
+        theta = np.minimum(32767, R.theta + self.theta_a)          # §9 rule 4
+        spike = (~refr) & (v2 >= theta)
+        reset_v = (v2 - theta) if R.reset_mode == 0 else np.zeros_like(v2)
         new_v = np.where(spike, reset_v, np.maximum(v2, R.v_min))
         self.v = np.where(refr, self.v, new_v)
         self.refc = np.where(refr, self.refc - 1, np.where(spike, R.refrac, 0))
         acc[:] = 0
+        self.theta_a = decay_floor(self.theta_a, R.th_decay_shift)
+        self.theta_a = np.where(spike, np.minimum(65535, self.theta_a + R.th_inc), self.theta_a)
         if R.learn_en:
             self.post_flag[:] = spike
         return spike
