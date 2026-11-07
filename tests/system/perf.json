@@ -1,0 +1,61 @@
+{
+  "config": {
+    "mesh": "2x2",
+    "cores_used": 2,
+    "N_NEURONS": 256,
+    "N_AXONS": 256,
+    "LANES": 8,
+    "W_BITS": 8,
+    "net": [
+      256,
+      256,
+      10
+    ],
+    "T": 24,
+    "samples": 256,
+    "dataset": "emulated N-MNIST (MNIST saccades), tests/train/fixtures/test_inputs.npz",
+    "clock_for_projection_hz": 100000000.0,
+    "simulator": "Verilator 5.020 (tests/system/tb_sys.sv)"
+  },
+  "accuracy": {
+    "rtl": 0.9765625,
+    "integer_torch": 0.9765625,
+    "rtl_equals_torch_predictions": true
+  },
+  "load_cycles": 70747,
+  "cfg_flits": 70736,
+  "cycles_per_timestep_mean": 2771.7080078125,
+  "cycles_per_timestep_max": 4927,
+  "cycles_per_timestep_min": 272,
+  "cycles_per_sample_mean": 66520.9921875,
+  "cycles_per_sample_with_state_reset_mean": 68406.59765625,
+  "state_reset_cycles_mean": 1885.60546875,
+  "input_events_per_sample_mean": 936.40234375,
+  "hidden_spikes_per_sample_mean": 1118.05859375,
+  "output_spikes_per_sample_mean": 34.46484375,
+  "sops_per_sample_mean": 250899.5859375,
+  "sops_per_cycle": 3.771735473071412,
+  "projected_at_100MHz": {
+    "samples_per_s": 1503.284853571247,
+    "samples_per_s_with_state_reset": 1461.847298743171,
+    "timesteps_per_s": 36078.83648570993,
+    "gsops_per_s": 0.3771735473071412,
+    "latency_per_sample_us": 665.209921875
+  },
+  "cycles_vs_input_events_fit": {
+    "cycles_per_event": 36.894253469881825,
+    "intercept_cycles": 31973.1267673961,
+    "r2": 0.932082003871238
+  },
+  "cycles_vs_all_spikes_fit": {
+    "cycles_per_spike": 31.821829328843883,
+    "intercept_cycles": 1144.286871598416,
+    "r2": 0.9999639521419201,
+    "spikes": "input events + hidden-layer spikes"
+  },
+  "definitions": {
+    "run_cycles": "sum over the T STEPs of cycles from the step pulse until drained and host output empty (includes injecting that step's input events)",
+    "sops": "synaptic operations = input_events * 256 (layer-0 fan-out) + hidden_spikes * 10",
+    "reset_cycles": "SpikeMeshHost.reset_state(): 2 silent STEPs + CFG rewrite of v/refc/theta_a/pointers"
+  }
+}
