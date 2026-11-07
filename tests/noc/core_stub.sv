@@ -20,6 +20,7 @@ module neurocore #(
     parameter int W_BITS       = 8,
     parameter int FANOUT_DEPTH = 1024,
     parameter int LANES        = 1,
+    parameter int LEARN        = 0,
     parameter int UPD_HOST     = 2,
     parameter int UPD_FWD      = 1
 ) (

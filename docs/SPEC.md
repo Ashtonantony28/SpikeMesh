@@ -183,3 +183,12 @@ These override the matching text in §2, §5 and §6.
 3. **Non-plastic axons.** Core register 23 `plastic_axon_max` (uint16, reset 0). When non-zero, axons `a >= plastic_axon_max` are fixed: their `pre_flag` is never set (no depression row), and in potentiation they are still visited and `sr()` is still drawn (LFSR order unchanged) but their weight (or eligibility) is not written. Their `x_pre` trace still updates.
 4. **Adaptive threshold.** Per-neuron `theta_a[n]` (uint16, reset value undefined like other neuron memories; the host writes it). Core registers 24 `th_inc` (uint16, reset 0) and 25 `th_decay_shift` (uint4, reset 0). In UPDATE (§2) the comparison and subtract-reset use `theta_eff = min(32767, theta + theta_a[n])`. After the spike decision, for every neuron (including refractory ones): first decay `theta_a` per rule 1 with `th_decay_shift`, then if the neuron spiked, `theta_a = min(65535, theta_a + th_inc)`. This works whether or not `learn_en` is set. Readback / write: region 11 debug space 6, index n.
 5. **Rewards while off.** A CTRL REWARD that arrives while `learn_en = 0` or `rstdp_en = 0` is dropped.
+
+## 10. NoC and host conventions (ADR-008)
+
+- y grows to the north; x grows to the east. The host port is the west side of (0, 0).
+- A packet whose destination is off-mesh (and not the host) is dropped at its ingress router, which sets a sticky `err` flag and counts it in `drop_cnt`.
+- Host-bound flits (dest_x = 15) ignore dest_y.
+- Delivery is in order for each (source, destination) pair.
+- The host must finish injecting all input events for timestep t before pulsing `step`, because quiescence may be declared during a gap in host injection. A `step` pulse during a running STEP is ignored and sets `step_err`.
+- `spikemesh_top` also takes `LANES`, `LEARN_MODE` (1 STDP, 2 R-STDP) and `LEARN_MASK` (bit y*MESH_X+x enables learning hardware in that core). Output `drained` is high when no STEP is running and every router and core is idle; hosts use it instead of an idle-cycle timeout.

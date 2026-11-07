@@ -8,8 +8,13 @@ module spikemesh_top #(
     parameter int N_AXONS        = 256,
     parameter int W_BITS         = 8,
     parameter int FANOUT_DEPTH   = 1024,
-    parameter int LANES          = 1,
+    parameter int LANES          = 8,
     parameter int FIFO_DEPTH     = 4,
+    // per-core learning hardware: bit (y*MESH_X + x) of LEARN_MASK selects
+    // neurocore LEARN = LEARN_MODE (1 STDP, 2 STDP + R-STDP) for that core;
+    // cleared bits get LEARN = 0 (inference only). Default: no learning.
+    parameter logic [224:0] LEARN_MASK = '0,
+    parameter int LEARN_MODE     = 1,
     parameter int QUIESCE_CYCLES = 4
 ) (
     input  logic        clk,
@@ -26,7 +31,8 @@ module spikemesh_top #(
     // debug / status (not in SPEC §8 table; safe to leave unconnected)
     output logic        err,         // sticky: NoC drop/overflow or step while running
     output logic [7:0]  drop_cnt,
-    output logic        busy         // a STEP is running
+    output logic        busy,        // a STEP is running
+    output logic        drained      // idle + mesh/cores quiet (rtl/top/tick_ctrl.sv)
 );
     localparam int NC = MESH_X * MESH_Y;
 
@@ -55,7 +61,8 @@ module spikemesh_top #(
                 localparam int N = gy * MESH_X + gx;
                 neurocore #(
                     .X(gx), .Y(gy), .N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS),
-                    .W_BITS(W_BITS), .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES)
+                    .W_BITS(W_BITS), .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES),
+                    .LEARN(LEARN_MASK[N] ? LEARN_MODE : 0)
                 ) u_core (
                     .clk(clk), .rst_n(rst_n),
                     .in_valid(c_in_valid[N]), .in_ready(c_in_ready[N]), .in_flit(c_in_flit[N*48 +: 48]),
@@ -73,7 +80,8 @@ module spikemesh_top #(
         .net_busy(mesh_busy | host_in_valid),
         .core_busy(c_busy),
         .learn_start(learn_start), .update_start(update_start), .step_done(step_done),
-        .parity(t_parity), .quiescent(quiescent), .running(busy), .step_err(step_err)
+        .parity(t_parity), .quiescent(quiescent), .running(busy), .step_err(step_err),
+        .drained(drained)
     );
 
     assign err = mesh_err | step_err;

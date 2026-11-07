@@ -95,6 +95,9 @@ async def step_protocol(dut):
     for t in range(nsteps):
         p = t & 1
         assert ival(dut.t_parity) == p
+        # host protocol: every input event for t is handed over before STEP(t)
+        while env.hin or env.hold is not None:
+            await FallingEdge(dut.clk)
         env.step_req = True
         await env.wait_event("ls")
         for (x, y) in nodes:
@@ -113,6 +116,12 @@ async def step_protocol(dut):
         # host events for t+1 may be injected any time after UPDATE(t) starts
         host_events(t + 1, rng.randrange(0, 20))
         await env.wait_event("sd")
+        # `drained` must rise after step_done once the UPDATE(t) spikes landed
+        for _ in range(2000):
+            await FallingEdge(dut.clk)
+            if ival(dut.drained):
+                break
+        assert ival(dut.drained) == 1 and ival(dut.u_mesh.busy) == 0
         host_events(t + 1, rng.randrange(0, 20))
         for _ in range(rng.randrange(0, 30)):
             await FallingEdge(dut.clk)
@@ -121,6 +130,9 @@ async def step_protocol(dut):
         await FallingEdge(dut.clk)
         if not env.hin and env.hold is None and ival(dut.u_mesh.busy) == 0 and ival(dut.host_out_valid) == 0:
             break
+    for _ in range(20):
+        await FallingEdge(dut.clk)
+    assert ival(dut.drained) == 1, "drained not asserted on an idle, empty chip"
     # pending host events for step nsteps were counted into cnt but not reported: drop those
     got = Counter(env.host_rx)
     # flits for spikes injected for step `nsteps` (forwarded ones) are expected too

@@ -35,7 +35,7 @@ class TickEnv:
         await Timer(4, unit="ns")
         rec = dict(c=self.cycle, step=step, net=nb, core=cb,
                    ls=ival(dut.learn_start), us=ival(dut.update_start), sd=ival(dut.step_done),
-                   q=ival(dut.quiescent), par=ival(dut.parity), run=ival(dut.running), err=ival(dut.step_err))
+                   q=ival(dut.quiescent), dr=ival(dut.drained), par=ival(dut.parity), run=ival(dut.running), err=ival(dut.step_err))
         self.hist.append(rec)
         self.cycle += 1
         self.net_left = max(0, self.net_left - 1)
@@ -52,6 +52,10 @@ class TickEnv:
                 lo = [raw(j) for j in range(max(0, i - Q - 1), i)]   # inputs before the trace are 0
                 if any(lo):
                     self.errors.append(f"cycle {i}: quiescent with busy in last {Q + 1} cycles")
+            if r["dr"]:
+                lo = [raw(j) for j in range(max(0, i - Q - 1), i)]
+                if any(lo) or r["run"]:
+                    self.errors.append(f"cycle {i}: drained while busy or running")
             if r["sd"] and r["core"]:
                 self.errors.append(f"cycle {i}: step_done while core busy")
             if r["ls"]:

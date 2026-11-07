@@ -21,8 +21,8 @@ module noc_fifo #(
     output logic                       ovf
 `ifdef FORMAL
     ,
-    input  logic [W-1:0]               fv_tag,      // formal: flit value to track
-    output logic [$clog2(DEPTH+1)-1:0] fv_tag_cnt   // formal: copies of fv_tag held
+    output logic [DEPTH*W-1:0]         fv_entries,  // formal: entry k = k-th oldest
+    output logic [DEPTH-1:0]           fv_valid     // formal: entry k is occupied
 `endif
 );
     localparam int PW = (DEPTH > 1) ? $clog2(DEPTH) : 1;
@@ -60,18 +60,18 @@ module noc_fifo #(
         if (do_wr) mem[wptr] <= wdata;
     end
 `ifdef FORMAL
-    // copies of the tracked flit among the valid entries
+    // occupied entries in queue order, for invariants in the parent
     always @(*) begin
         logic [PW-1:0] p;
-        fv_tag_cnt = '0;
         for (int k = 0; k < DEPTH; k++) begin
             p = wrap({1'b0, rptr} + (PW+1)'(k));
-            if (CW'(k) < count && mem[p] == fv_tag) fv_tag_cnt = fv_tag_cnt + CW'(1);
+            fv_entries[k*W +: W] = mem[p];
+            fv_valid[k]          = (CW'(k) < count);
         end
     end
     always @(*) begin
         assert (count <= CW'(DEPTH));
-        assert (rptr < PW'(DEPTH) || DEPTH == 1);
+        assert ({1'b0, rptr} < (PW+1)'(DEPTH));
     end
 `endif
 endmodule

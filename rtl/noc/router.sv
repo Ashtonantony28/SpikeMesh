@@ -59,8 +59,14 @@ module router #(
     // Input FIFOs
     // ------------------------------------------------------------------
 `ifdef FORMAL
-    (* anyconst *) logic [47:0] fv_tag;     // the one flit value tracked by the tag proof
-    logic [CW-1:0] fv_tcnt [5];
+    // the one flit value tracked by the tag proof: free in cycle 0, then held
+    // constant by an assumption (works with both smtbmc and yosys `sat`,
+    // which treats $anyconst like $anyseq)
+    (* anyseq *) logic [47:0] fv_tag;
+    logic [47:0] fv_tag_q;
+    always @(posedge clk) fv_tag_q <= fv_tag;
+    logic [FIFO_DEPTH*48-1:0] fv_ent [5];
+    logic [FIFO_DEPTH-1:0]    fv_val [5];
 `endif
     logic [47:0]   head  [5];
     /* verilator lint_off UNUSEDSIGNAL */
@@ -79,7 +85,7 @@ module router #(
                 .rd(pop[gi]), .head(head[gi]), .count(fcount[gi]),
                 .full(ffull[gi]), .empty(fempty[gi]), .ovf(fovf[gi])
 `ifdef FORMAL
-                , .fv_tag(fv_tag), .fv_tag_cnt(fv_tcnt[gi])
+                , .fv_entries(fv_ent[gi]), .fv_valid(fv_val[gi])
 `endif
             );
         end
@@ -211,6 +217,7 @@ module router #(
     logic f_past_valid = 1'b0;
     always @(posedge clk) f_past_valid <= 1'b1;
     always @(*) assume (rst_n == f_past_valid);   // reset in cycle 0 only
+    always @(*) if (f_past_valid) assume (fv_tag == fv_tag_q);
 
     // ---- independent reference XY routing (written differently on purpose)
     function automatic logic [2:0] ref_route(input logic [47:0] f);
@@ -224,6 +231,32 @@ module router #(
         else                                   ref_route = 3'(PL);
     endfunction
 
+    // ---- environment: XY-consistent neighbours (assume-guarantee) ----
+    // xy_ok(p, f, rx, ry): flit f may legally arrive on input port p of the
+    // router at (rx, ry) when every router upstream routes XY. Each router
+    // ASSUMES this for flits from its neighbours and ASSERTS it (P11) for
+    // the flits it sends to its neighbours, so the argument composes over
+    // the whole mesh. The local port and the host port of (0,0) are free.
+    function automatic logic xy_ok(input integer p, input logic [47:0] f, input integer rx, input integer ry);
+        integer dx, dy;
+        logic host, valid;
+        dx = {28'd0, f[45:42]};
+        dy = {28'd0, f[41:38]};
+        host  = (dx == 15);
+        valid = (dx < MESH_X) && (dy < MESH_Y);
+        case (p)
+            PN:      xy_ok = (valid && dx == rx && dy <= ry) || (host && rx == 0);  // moving south
+            PS:      xy_ok = valid && dx == rx && dy >= ry;                         // moving north
+            PE:      xy_ok = (valid && dx <= rx) || host;                           // moving west
+            default: xy_ok = valid && dx >= rx;                                     // moving east
+        endcase
+    endfunction
+    always @(*) begin
+        for (int i = 0; i < 4; i++)
+            if (in_valid[i] && !(i == PW && X == 0 && Y == 0))
+                assume (xy_ok(i, in_flit[i*48 +: 48], X, Y));
+    end
+
     // ---- environment: credit protocol on N/E/S/W ----
     // up_owed[i]: flits the upstream neighbour sent into input i minus credits
     // it got back. It may only send while up_owed < FIFO_DEPTH.
@@ -233,7 +266,7 @@ module router #(
     logic [CW-1:0] dn_owed [4];
     always @(*) begin
         for (int i = 0; i < 4; i++) begin
-            assume (!(in_valid[i] && up_owed[i] == CW'(FIFO_DEPTH)));
+            assume (!(in_valid[i] && up_owed[i] >= CW'(FIFO_DEPTH)));
             assume (!(credit_in[i] && dn_owed[i] == '0));
         end
     end
@@ -270,13 +303,15 @@ module router #(
     // ---- tagged flit: one arbitrary flit value fv_tag, injected at most once
     logic [1:0] t_in, t_out, t_drop;
     logic [2:0] t_in_now, t_out_now, t_drop_now;
-    logic [3:0] t_held;
+    logic [7:0] t_held;   // wide enough for 5*FIFO_DEPTH+5 (unreachable) copies
     always @(*) begin
         t_in_now = '0; t_out_now = '0; t_drop_now = '0; t_held = '0;
         for (int i = 0; i < 5; i++) begin
             if (fwr[i] && (!ffull[i] || pop[i]) && in_flit[i*48 +: 48] == fv_tag) t_in_now = t_in_now + 3'd1;
             if (drop[i] && head[i] == fv_tag) t_drop_now = t_drop_now + 3'd1;
-            t_held = t_held + 4'(fv_tcnt[i]) + 4'(oreg_v[i] && oreg_f[i] == fv_tag);
+            for (int k = 0; k < FIFO_DEPTH; k++)
+                t_held = t_held + 8'(fv_val[i][k] && fv_ent[i][k*48 +: 48] == fv_tag);
+            t_held = t_held + 8'(oreg_v[i] && oreg_f[i] == fv_tag);
         end
         for (int o = 0; o < 4; o++) if (oreg_v[o] && oreg_f[o] == fv_tag) t_out_now = t_out_now + 3'd1;
         if (oreg_v[PL] && l_out_ready && oreg_f[PL] == fv_tag) t_out_now = t_out_now + 3'd1;
@@ -294,28 +329,35 @@ module router #(
     always @(*) begin
         if (rst_n) begin
             // P1 credit counters never exceed FIFO_DEPTH and exactly mirror the
-            //    downstream FIFO space (=> downstream FIFO never overflows)
+            //    downstream FIFO space: credits + flit on the link + flits the
+            //    downstream still owes credit for == FIFO_DEPTH (=> the
+            //    downstream FIFO never overflows)
             for (int o = 0; o < 4; o++) begin
                 assert (credits[o] <= CW'(FIFO_DEPTH));
-                assert ({1'b0, credits[o]} + {1'b0, dn_owed[o]} == (CW+1)'(FIFO_DEPTH));
+                assert ({1'b0, credits[o]} + {1'b0, dn_owed[o]} + (CW+1)'(oreg_v[o]) == (CW+1)'(FIFO_DEPTH));
             end
             // P2 input FIFO occupancy + returned-but-unseen credit == upstream debt,
             //    so a credit-respecting upstream can never overflow an input FIFO
             for (int i = 0; i < 4; i++) begin
                 assert (fcount[i] <= CW'(FIFO_DEPTH));
                 assert ({1'b0, fcount[i]} + (CW+1)'(credit_out[i]) == {1'b0, up_owed[i]});
+                assert (up_owed[i] <= CW'(FIFO_DEPTH));
                 assert (!fovf[i]);
             end
             // P3 conservation: accepted - departed - dropped == flits held
             assert (f_inflight == f_held);
+            assert (f_inflight <= FW'(5 * FIFO_DEPTH + 5));
+`ifndef FV_NO_TAG   // tag proof is costly at FIFO_DEPTH > 2; run.sh separates it
             // P4 tagged flit: never duplicated, never lost or corrupted
-            assert ({2'b0, t_in} == {2'b0, t_out} + {2'b0, t_drop} + t_held);
-            assert (t_out + t_drop <= 2'd1);
+            assert ({6'b0, t_in} == {6'b0, t_out} + {6'b0, t_drop} + t_held);
+            assert (t_in <= 2'd1 && t_out <= 2'd1 && t_drop <= 2'd1 && t_held <= 8'd1);
+            assert ({1'b0, t_out} + {1'b0, t_drop} <= 3'd1);
             // P5 a departing tagged flit uses the reference XY port; drops only off-mesh
             for (int o = 0; o < 4; o++)
                 if (oreg_v[o] && oreg_f[o] == fv_tag) assert (ref_route(fv_tag) == 3'(o));
             if (oreg_v[PL] && oreg_f[PL] == fv_tag) assert (ref_route(fv_tag) == 3'(PL));
             if (t_drop_now != '0) assert (ref_route(fv_tag) == 3'(PDROP));
+`endif
             // P6 each input is granted by at most one output; arbitration is
             //    work conserving (a requested output that can send, sends)
             for (int i = 0; i < 5; i++)
@@ -336,6 +378,17 @@ module router #(
             if (Y == 0)          assert (!oreg_v[PS]);
             if (X == MESH_X - 1) assert (!oreg_v[PE]);
             if (X == 0 && Y != 0) assert (!oreg_v[PW]);
+            // I1 inductive helper: every flit buffered in a neighbour-fed FIFO
+            //    still satisfies the xy_ok assumption it arrived under
+            for (int i = 0; i < 4; i++)
+                for (int k = 0; k < FIFO_DEPTH; k++)
+                    if (fv_val[i][k] && !(i == PW && X == 0 && Y == 0))
+                        assert (xy_ok(i, fv_ent[i][k*48 +: 48], X, Y));
+            // P11 guarantee: flits sent to a neighbour satisfy its xy_ok assumption
+            if (oreg_v[PN]) assert (xy_ok(PS, oreg_f[PN], X, Y + 1));
+            if (oreg_v[PS]) assert (xy_ok(PN, oreg_f[PS], X, Y - 1));
+            if (oreg_v[PE]) assert (xy_ok(PW, oreg_f[PE], X + 1, Y));
+            if (oreg_v[PW] && !(X == 0 && Y == 0)) assert (xy_ok(PE, oreg_f[PW], X - 1, Y));
             // P10 busy is exactly "some flit held"
             assert (busy == (f_held != '0));
             // round-robin pointers stay in range

@@ -8,3 +8,4 @@ obj_dir/
 data/
 runs/
 .pytest_cache/
+formal/build/

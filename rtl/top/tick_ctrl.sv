@@ -19,6 +19,13 @@
 // (a core that registers the pulse and raises busy the next cycle is fine),
 // or the core must have finished the work by then.
 //
+// drained: level, high while no STEP is running AND the quiescence condition
+// holds (raw busy OR low for the last QUIESCE_CYCLES+1 cycles). After
+// step_done it rises once every spike emitted by UPDATE(t) has reached its
+// core (and been accumulated) or the host-out FIFO; host-bound flits may
+// still be waiting in that FIFO (host_out_valid). Host injection makes it
+// fall again. It is the exact replacement for an "output idle N cycles" rule.
+//
 // A `step` that arrives while a STEP is running is ignored and sets the
 // sticky `step_err` output.
 module tick_ctrl #(
@@ -37,7 +44,8 @@ module tick_ctrl #(
     output logic          parity,
     output logic          quiescent,     // 1 in the cycle quiescence is declared
     output logic          running,       // a STEP is in progress
-    output logic          step_err
+    output logic          step_err,
+    output logic          drained        // idle and quiet (see header)
 );
     localparam int QW = $clog2(QUIESCE_CYCLES + 1);
     localparam int GW = $clog2(START_GUARD + 1);
@@ -53,6 +61,7 @@ module tick_ctrl #(
     assign quiescent = (state == S_QUIESCE) && (quiet_cnt >= QW'(QUIESCE_CYCLES)) && !busy_r;
     assign step_done = (state == S_WAIT_UPD) && (guard == '0) && !core_any;
     assign running   = (state != S_IDLE);
+    assign drained   = (state == S_IDLE) && (quiet_cnt >= QW'(QUIESCE_CYCLES)) && !busy_r;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -98,4 +107,57 @@ module tick_ctrl #(
             endcase
         end
     end
+`ifdef FORMAL
+    // ==================================================================
+    // Formal properties (formal/run.sh). Inputs are unconstrained except
+    // that reset is applied in cycle 0 only.
+    // ==================================================================
+    logic f_past_valid = 1'b0;
+    always @(posedge clk) f_past_valid <= 1'b1;
+    always @(*) assume (rst_n == f_past_valid);
+
+    // raw busy history: f_hist[k] = raw OR (k+1) cycles ago; ones after reset
+    logic [QUIESCE_CYCLES:0] f_hist;
+    always @(posedge clk) begin
+        if (!rst_n) f_hist <= '1;
+        else        f_hist <= {f_hist[QUIESCE_CYCLES-1:0], net_busy | core_any};
+    end
+    // phase tracker: 0 idle, 1 quiesce, 2 learn issued, 3 update issued
+    logic [1:0] f_phase;
+    always @(posedge clk) begin
+        if (!rst_n) f_phase <= 2'd0;
+        else if (state == S_IDLE && step)  f_phase <= 2'd1;
+        else if (quiescent)                f_phase <= 2'd2;
+        else if (state == S_WAIT_LEARN && guard == '0 && !core_any) f_phase <= 2'd3;
+        else if (step_done)                f_phase <= 2'd0;
+    end
+    always @(*) begin
+        if (rst_n) begin
+            // T1 step_done never while any core is busy
+            if (step_done) assert (!core_any);
+            // T2 quiescence never declared if any busy input was high in the
+            //    last QUIESCE_CYCLES+1 cycles
+            if (quiescent) assert (f_hist == '0);
+            if (drained)   assert (f_hist == '0 && state == S_IDLE);
+            // T3 the start pulses follow the SPEC section 8 order
+            if (learn_start)  assert (f_phase == 2'd2 && state == S_WAIT_LEARN);
+            if (update_start) assert (f_phase == 2'd3 && state == S_WAIT_UPD);
+            if (step_done)    assert (f_phase == 2'd3);
+            assert (!(learn_start && update_start));
+            // helper invariants (make the induction go through)
+            assert (state == S_IDLE || state == S_QUIESCE || state == S_WAIT_LEARN || state == S_WAIT_UPD);
+            assert (guard <= GW'(START_GUARD));
+            assert (quiet_cnt <= QW'(QUIESCE_CYCLES));
+            assert (busy_r == f_hist[0]);
+            for (int k = 0; k < QUIESCE_CYCLES; k++)
+                if (quiet_cnt > QW'(k)) assert (!f_hist[k+1]);
+            assert ((f_phase == 2'd0) == (state == S_IDLE));
+            assert ((f_phase == 2'd1) == (state == S_QUIESCE));
+            assert ((f_phase == 2'd2) == (state == S_WAIT_LEARN));
+            assert ((f_phase == 2'd3) == (state == S_WAIT_UPD));
+            if (learn_start || update_start) assert (guard == GW'(START_GUARD));
+            if (state == S_IDLE || state == S_QUIESCE) assert (!learn_start && !update_start);
+        end
+    end
+`endif
 endmodule
