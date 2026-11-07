@@ -36,10 +36,33 @@ class LFSR16:
         self.state = s
         return s
 
+    # The maximal-length sequence is cached once: _SEQ[i + 1] = next(_SEQ[i]),
+    # _SEQ[0] = 1, and _POS[state] = i. take(k) is then a slice of the cycle
+    # (pure speed-up; identical to calling next() k times, see tests/learn).
+    _SEQ: np.ndarray | None = None
+    _POS: np.ndarray | None = None
+    PERIOD = 65535
+
+    @classmethod
+    def _cycle(cls):
+        if cls._SEQ is None:
+            seq = np.empty(cls.PERIOD, dtype=np.int64)
+            s = 1
+            for i in range(cls.PERIOD):
+                seq[i] = s
+                s = (s >> 1) ^ (0xB400 if s & 1 else 0)
+            pos = np.full(1 << 16, -1, dtype=np.int64)
+            pos[seq] = np.arange(cls.PERIOD)
+            cls._SEQ, cls._POS = seq, pos
+        return cls._SEQ, cls._POS
+
     def take(self, k: int) -> np.ndarray:
-        out = np.empty(k, dtype=np.int64)
-        for i in range(k):
-            out[i] = self.next()
+        if k <= 0:
+            return np.empty(0, dtype=np.int64)
+        seq, pos = self._cycle()
+        i = int(pos[self.state])
+        out = seq[(i + 1 + np.arange(k)) % self.PERIOD]
+        self.state = int(out[-1])
         return out
 
 
@@ -216,14 +239,17 @@ class Core:
                 self.pending_reward = 0
         target = self.elig if R.rstdp_en else self.w
         lo, hi = (-32768, 32767) if R.rstdp_en else (R.w_min, R.w_max)
-        # 2. depression, rows ascending
-        for a in np.flatnonzero(self.pre_flag):
-            d = self._sr(R.stdp_a_minus * self.x_post)
-            target[a] = sat(target[a] - d, lo, hi)
-        # 3. potentiation, columns ascending
-        for n in np.flatnonzero(self.post_flag):
-            d = self._sr(R.stdp_a_plus * self.x_pre)
-            target[:, n] = sat(target[:, n] + d, lo, hi)
+        # 2. depression, rows ascending (one LFSR draw per weight, row-major;
+        #    every weight is visited once, so the rows are done together)
+        rows = np.flatnonzero(self.pre_flag)
+        if rows.size:
+            d = self._sr(np.tile(R.stdp_a_minus * self.x_post, rows.size)).reshape(rows.size, self.N)
+            target[rows] = sat(target[rows] - d, lo, hi)
+        # 3. potentiation, columns ascending (draws column-major)
+        cols = np.flatnonzero(self.post_flag)
+        if cols.size:
+            d = self._sr(np.tile(R.stdp_a_plus * self.x_pre, cols.size)).reshape(cols.size, self.A)
+            target[:, cols] = sat(target[:, cols] + d.T, lo, hi)
         # 4. trace bumps
         self.x_pre[self.pre_flag] = np.minimum(self.x_pre[self.pre_flag] + R.inc_pre, 255)
         self.x_post[self.post_flag] = np.minimum(self.x_post[self.post_flag] + R.inc_post, 255)
