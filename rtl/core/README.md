@@ -74,6 +74,7 @@ CFG and READ flits, and spikes for the bank being updated, are held off by head-
 - **State**:
   - `x_pre[A]`: memory, 8 bit.
   - `x_post[N]`: memory, G × LANES·8.
+  - Both trace memories are zeroed after reset (SPEC §5 resets traces): one x_pre entry and one x_post row per cycle, max(A, G) cycles, with `busy` high. The eligibility memory (R-STDP) is not cleared (AUDIT-1, open finding M2).
   - `pre_flag[A]`, `pre_seen[A]`, `post_flag[N]`: flip-flops. `pre_seen` is set when a spike is accepted while `learn_en` is set, and drives the x_pre bump. `pre_flag` is set as well, but only for a plastic axon (`plastic_axon_max = 0`, or `a < plastic_axon_max`). It drives depression and is what debug space 3 reads (§9.3). Both decisions are made when the spike arrives, as golden makes them. `post_flag[n]` is overwritten with `fire` for every neuron in UPDATE stage C, as golden does.
   - The 16-bit Galois LFSR: reloaded on every CFG write of `lfsr_seed` (0 becomes 1), and reset to 1.
   - LEARN=2 only: `e[a][n]` (int16), laid out like the weight memory.

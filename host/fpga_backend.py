@@ -92,22 +92,47 @@ class _LinkBackend(Backend):
         """Issue command `op`, collect words until its event; return the event
         word and append the other words to self._rx."""
 
+    # Every READ_REQ produces a READ_RESP that waits in the chip until the host
+    # reads it. On the AXI DMA path nothing is read until an S2MM transfer is
+    # armed (only inside _command), so a long READ_REQ burst would fill the
+    # chip, stall host_in and hang the MM2S send. At most this many responses
+    # are left unread: 4 always fit in the target core's output FIFO, whatever
+    # cores they come from. Beyond that, send_flits issues a FLUSH, which also
+    # bounds the UART receive buffer the OS must hold. (AUDIT-1)
+    MAX_UNREAD_READS = 4
+
+    def _is_read_req(self, w: int) -> bool:
+        return (w >> 46) == 2 and not (w >> 37) & 1
+
     # Backend interface
     def send_flits(self, flits) -> None:
         words = [int(f) & WORD_MASK for f in flits]
         bad = [w for w in words if is_link_word(w)]
         if bad:
             raise ValueError(f"flit {bad[0]:#014x} uses the reserved link header (CTRL to 15/15)")
-        if words:
-            self._send_words(words)
+        chunk: list[int] = []
+        for w in words:
+            if self._is_read_req(w):
+                if getattr(self, "_unread", 0) >= self.MAX_UNREAD_READS:
+                    if chunk:
+                        self._send_words(chunk)
+                        chunk = []
+                    self._command(CMD_FLUSH)      # responses go to self._rx, in order
+                    self._unread = 0
+                self._unread = getattr(self, "_unread", 0) + 1
+            chunk.append(w)
+        if chunk:
+            self._send_words(chunk)
 
     def step(self) -> None:
+        self._unread = 0                          # STEP drains the chip output too
         ev = self._command(CMD_STEP)
         self.last_step = decode_event(ev)
         if self.last_step["err"]:
             raise LinkError(f"chip error flag set after STEP: {self.last_step}")
 
     def recv_flits(self) -> list[int]:
+        self._unread = 0
         self._command(CMD_FLUSH)
         out, self._rx = self._rx, []
         return out

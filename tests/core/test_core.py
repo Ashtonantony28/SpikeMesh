@@ -148,6 +148,13 @@ def test_learn_variants(cfg, seed, mode):
     _run("icarus", cfg, "test_learn", SEED=seed, MODE=mode, STEPS=8, BP=0.3)
 
 
+@pytest.mark.parametrize("cfg,seed", [("small_l2", 171), ("rect_l2", 172), ("g1_l2", 173)])
+def test_learn_traces_reset(cfg, seed):
+    """AUDIT-1: SPEC §5 resets the traces; the host does not write them here.
+    Icarus leaves un-reset SRAM at X, so this fails if the RTL relies on it."""
+    _run("icarus", cfg, "test_learn", SEED=seed, MODE="stdp_notrace", STEPS=8, BP=0.3)
+
+
 def test_learn_build_inference_unchanged():
     """learn_en = 0 on a LEARN=2 build behaves exactly like inference."""
     _run("icarus", "small_l2", "test_random", SEED=121, MODE="mixed", STEPS=12, BP=0.3)

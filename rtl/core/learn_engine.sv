@@ -207,7 +207,26 @@ module learn_engine #(
     reg           k_fixed;      // POT: axon k is non-plastic (sr drawn, no write)
 
     wire use_e = rstdp_en;
-    assign busy = (ph != P_IDLE) || start;
+    // SPEC §5: traces are control state, reset by rst_n. The trace memories
+    // are plain SRAMs, so they are zeroed after reset (one entry / row per
+    // cycle, max(N_AXONS, G) cycles; busy stays high meanwhile). AUDIT-1.
+    localparam integer ICLR = (N_AXONS > G) ? N_AXONS : G;
+    localparam integer IW   = $clog2(ICLR + 1);
+    reg          init_clr;
+    reg [IW-1:0] init_i;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [31:0]  init_i32 = {{(32-IW){1'b0}}, init_i};
+    /* verilator lint_on UNUSEDSIGNAL */
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            init_clr <= 1'b1;
+            init_i   <= '0;
+        end else if (init_clr) begin
+            init_i <= init_i + 1'b1;
+            if (init_i32 == 32'(ICLR - 1)) init_clr <= 1'b0;
+        end
+    end
+    assign busy = (ph != P_IDLE) || start || init_clr;
 
     /* verilator lint_off UNUSEDSIGNAL */
     wire [31:0] d_a32  = {{(31-AB){1'b0}}, d_a};
@@ -379,6 +398,16 @@ module learn_engine #(
         xq_wmask = k_valid ? {LANES{1'b1}} : di_mask;
         xq_waddr = k_valid ? k_i[GAW-1:0] : di_row[GAW-1:0];
         xq_wdata = k_valid ? xq_res : {LANES{dbg_wdata[7:0]}};
+        // reset clear of both trace memories (no LEARN / debug access meanwhile)
+        if (init_clr) begin
+            xp_we    = (init_i32 < 32'(N_AXONS));
+            xp_waddr = init_i32[AB-1:0];
+            xp_wdata = 8'd0;
+            xq_we    = (init_i32 < 32'(G));
+            xq_wmask = {LANES{1'b1}};
+            xq_waddr = init_i32[GAW-1:0];
+            xq_wdata = '0;
+        end
     end
 
     // ------------------------------------------------------------------

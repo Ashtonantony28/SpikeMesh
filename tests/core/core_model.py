@@ -296,11 +296,13 @@ def learn_config(rng, g: Core, mode):
     }
     fl = [cfg(g, flits.addr_reg(r), v) for r, v in regs.items()]
     ordered = []
-    for a in range(A):
+    # mode "*_notrace" (AUDIT-1 regression): traces are never written, so the
+    # RTL must start them at their SPEC §5 reset value 0, like golden does.
+    for a in range(0 if mode.endswith("notrace") else A):
         x = rng.choice([0, rng.randint(0, 255), 255])
         g.x_pre[a] = x
         ordered.append(flits.cfg_write(CX, CY, dbg_addr(DBG_XPRE, a), x | rng.randint(0, 255) << 8))
-    for n in range(N):
+    for n in range(0 if mode.endswith("notrace") else N):
         x = rng.choice([0, rng.randint(0, 255), 255])
         g.x_post[n] = x
         ordered.append(flits.cfg_write(CX, CY, dbg_addr(DBG_XPOST, n), x))

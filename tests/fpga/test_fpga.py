@@ -120,3 +120,66 @@ def test_codec():
                   "mesh_x": 2, "mesh_y": 3, "n_neurons": 64}
     with pytest.raises(ValueError):
         FB.unpack_words(b"\x00" * 7)
+
+
+class _DmaLikeIO:
+    """AxiStreamBackend I/O that behaves like the real AXI DMA (AUDIT-1): chip
+    output is only drained while an S2MM transfer is armed (recv_until_last).
+    Without a reader, READ_RESPs back up into the chip, and once the chip's
+    buffering is full the next READ_REQ cannot enter: MM2S never completes
+    (sendchannel.wait() hangs on the board). Modelled as an exception. CAP is a
+    conservative lower bound of the 2x2 chip's buffering (core output FIFO 4 +
+    router FIFO 4 + host-out FIFO 4)."""
+
+    CAP = 12
+
+    def __init__(self):
+        from host import fpga_backend as FB
+        self.FB, self.out, self.event = FB, [], None
+
+    def reg_read(self, off):
+        FB = self.FB
+        return {FB.REG_ID: FB.ID_VALUE, FB.REG_CONFIG: 0x00552822}.get(off, 0)
+
+    def reg_write(self, off, val):
+        FB = self.FB
+        if off == FB.REG_CTRL and val & FB.CTRL_FLUSH:
+            self.event = FB.HDR | FB.EV_FLUSH_DONE
+        elif off == FB.REG_CTRL and val & FB.CTRL_STEP:
+            self.event = FB.HDR | FB.EV_STEP_DONE
+
+    def send(self, words):
+        from compiler import flits as F
+        FB = self.FB
+        for w in words:
+            if FB.is_link_word(w):
+                assert w & 0xFF == FB.CMD_STATUS
+                self.event = FB.HDR | 5 << 32 | 2 << 28 | 2 << 24 | FB.EV_STATUS
+                continue
+            d = F.decode(w)
+            if d["type"] == F.READ and not d.get("resp"):
+                if len(self.out) >= self.CAP:
+                    raise RuntimeError("DMA deadlock: READ_RESPs backed up with no S2MM transfer armed")
+                self.out.append(F.read_resp(d["reply_x"], d["reply_y"], d["addr"], d["addr"] & 0xFFFF))
+
+    def recv_until_last(self, trigger):
+        trigger()
+        words, self.out = self.out + [self.event], []
+        self.event = None
+        return words
+
+
+def test_axi_backend_bulk_readback_no_deadlock():
+    """AUDIT-1: hundreds of READ_REQs in one send_flits() (e.g. weight readback
+    after on-chip learning) must not stall the MM2S DMA on the board."""
+    from host import fpga_backend as FB
+    from compiler import flits as F
+    be = FB.AxiStreamBackend(_DmaLikeIO())
+    addrs = [F.addr_weight(a, n, 32) for a in range(8) for n in range(32)]
+    be.send_flits([F.cfg_write(1, 0, a, 1) for a in addrs[:5]])
+    be.send_flits([F.read_req(1, 0, a, 15, 0) for a in addrs])
+    be.send_flits([F.read_req(0, 1, a, 15, 0) for a in addrs[:3]])   # leftovers across calls
+    be.send_flits([F.read_req(0, 1, a, 15, 0) for a in addrs[3:6]])
+    got = [F.decode(w) for w in be.recv_flits()]
+    assert [d["addr16"] for d in got] == [a & 0xFFFF for a in addrs + addrs[:6]]
+    assert all(d["type"] == F.READ and d["resp"] for d in got)
