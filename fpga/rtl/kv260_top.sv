@@ -65,6 +65,9 @@ module kv260_top #(
     wire        c_in_valid, c_in_ready, c_out_valid, c_out_ready, c_step, c_step_done, c_running;
     wire [47:0] c_in_flit, c_out_flit;
     wire [7:0]  c_drop;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire        c_drained;   // spikemesh_top quiet flag; the link uses its own drain timer
+    /* verilator lint_on UNUSEDSIGNAL */
 
     spikemesh_top #(
         .MESH_X(MESH_X), .MESH_Y(MESH_Y), .N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS),
@@ -74,7 +77,7 @@ module kv260_top #(
         .host_in_valid(c_in_valid), .host_in_ready(c_in_ready), .host_in_flit(c_in_flit),
         .host_out_valid(c_out_valid), .host_out_ready(c_out_ready), .host_out_flit(c_out_flit),
         .step(c_step), .step_done(c_step_done), .t_parity(t_parity),
-        .err(chip_err), .drop_cnt(c_drop), .busy(c_running)
+        .err(chip_err), .drop_cnt(c_drop), .busy(c_running), .drained(c_drained)
     );
 
     // bridges

@@ -30,6 +30,7 @@ MODE = os.environ.get("MODE", "mixed")
 BP = float(os.environ.get("BP", 0.3))          # out_ready low probability
 IN_GAP = float(os.environ.get("IN_GAP", 0.1))  # in_valid gap probability
 LEARN = int(os.environ.get("LEARN", 0))        # RTL build parameter
+ADAPT = int(os.environ.get("ADAPT", 1))        # RTL build parameter ADAPT_TH
 G = N // LANES
 WMIN, WMAX = -(1 << (W - 1)), (1 << (W - 1)) - 1
 
@@ -39,8 +40,19 @@ def s16(v):
     return v - 0x10000 if v & 0x8000 else v
 
 
+DBG_THETA_A = 6          # region 11 debug space 6: theta_a[n] (SPEC §9.4)
+REG_PAM, REG_TH_INC, REG_TH_DSHIFT = 23, 24, 25
+
+
+def is_adapt_addr(addr):
+    """Addresses that an ADAPT_TH = 0 build ignores (regs 24/25, theta_a)."""
+    return (addr >> 20 & 3) == 3 and ((addr >> 16 & 0xF) == DBG_THETA_A or
+                                      ((addr >> 16 & 0xF) == 0 and (addr & 0xFF) in (REG_TH_INC, REG_TH_DSHIFT)))
+
+
 def cfg(g: Core, addr, data):
-    g.cfg_write(addr, data)
+    if ADAPT or not is_adapt_addr(addr):   # ADAPT_TH = 0: golden keeps theta_a = 0
+        g.cfg_write(addr, data)
     return flits.cfg_write(CX, CY, addr, data)
 
 
@@ -73,6 +85,15 @@ def random_network(rng, mode):
         regs[4] = rng.randint(-400, -50)
     if mode in ("reset0", "reset1"):
         regs[2] = int(mode[-1])
+    # adaptive threshold (SPEC §9.4); "adapt" stresses the saturations and floor
+    if mode == "adapt":
+        regs[REG_TH_INC] = rng.choice([0xFFFF, rng.randint(0x8000, 0xFFFF)])   # small values: other modes
+        regs[REG_TH_DSHIFT] = rng.choice([1, 2, rng.randint(5, 15), 15])
+        regs[0] = rng.randint(1, 60)
+        regs[2], regs[3] = 0, rng.choice([0, 0, 1])   # saturated neurons keep firing
+    else:
+        regs[REG_TH_INC] = rng.choice([0, 0, rng.randint(0, 50), rng.randint(0, 0xFFFF)])
+        regs[REG_TH_DSHIFT] = rng.choice([0, 0, rng.randint(0, 15)])
     for r, v in regs.items():
         fl.append(cfg(g, flits.addr_reg(r), v & 0xFFFF))
     # --- weights (all written; memories are undefined after reset)
@@ -123,12 +144,19 @@ def random_network(rng, mode):
             v, b = rng.choice([32767, -32768, rng.randint(-32768, 32767)]), rng.choice([32767, -32768, 0, rng.randint(-32768, 32767)])
         elif mode == "leakneg":
             v, b = rng.randint(-3000, 50), rng.randint(-10, 30)
+        elif mode == "adapt" and n % 4 == 0:   # v saturates: fires even at theta_eff = 32767
+            v, b = 32767, 32767
         else:
             v, b = rng.randint(-100, 100), rng.randint(-20, 40)
         rc = rng.choice([0, 0, 0, rng.randint(0, 15)])
         fl.append(cfg(g, flits.addr_neuron(n, 0), v & 0xFFFF))
         fl.append(cfg(g, flits.addr_neuron(n, 1), b & 0xFFFF))
         fl.append(cfg(g, flits.addr_neuron(n, 2), rc))
+        if mode == "adapt":
+            ta = rng.choice([0, 1, 2, rng.randint(0, 30), 32767, 65535, rng.randint(0, 65535), rng.randint(32700, 32767)])
+        else:
+            ta = rng.choice([0, 0, 0, rng.randint(0, 40), rng.randint(0, 65535)])
+        fl.append(cfg(g, dbg_addr(DBG_THETA_A, n), ta))
     rng.shuffle(fl)   # order of independent writes must not matter
     return g, fl, host_axons
 
@@ -145,7 +173,14 @@ def coverage(g: Core, p):
     leak = (g.v >> R.leak_shift) if R.leak_shift else np.zeros_like(g.v)
     raw = g.v - leak + np.clip(acc, -32768, 32767) + g.bias
     v2 = np.clip(raw, -32768, 32767)
-    fire = act & (v2 >= R.theta)
+    th_raw = R.theta + g.theta_a
+    fire = act & (v2 >= np.minimum(32767, th_raw))
+    k = R.th_decay_shift
+    ta_dec = g.theta_a - (np.where(g.theta_a > 0, np.maximum(g.theta_a >> k, 1), 0) if k else 0)
+    COV["theta_sat"] += int((act & (th_raw > 32767)).sum())
+    COV["theta_a_fire"] += int((fire & (g.theta_a > 0)).sum())
+    COV["theta_a_floor"] += int(((g.theta_a > 0) & (k > 0) & ((g.theta_a >> k) == 0)).sum())
+    COV["theta_a_inc_sat"] += int((fire & (ta_dec + R.th_inc > 65535)).sum())
     COV["refractory"] += int((~act).sum())
     COV["fire"] += int(fire.sum())
     COV["acc_sat_hi"] += int((act & (acc > 32767)).sum())
@@ -189,6 +224,7 @@ def make_events(rng, host_axons, mode=MODE, steps=STEPS):
 
 def state_addrs(rng, n_weights=64):
     addrs = [flits.addr_neuron(n, f) for n in range(N) for f in (0, 2)]
+    addrs += [dbg_addr(DBG_THETA_A, n) for n in range(N)]
     addrs += [flits.addr_neuron(rng.randrange(N), rng.randrange(4)) for _ in range(8)]
     addrs += [flits.addr_weight(rng.randrange(A), rng.randrange(N), N) for _ in range(n_weights)]
     return addrs
@@ -203,6 +239,8 @@ def check_coverage(mode=MODE):
         assert COV["leak_neg_v"] > 0 and COV["v_min_clamp"] > 0, COV
     if mode == "refrac":
         assert COV["refractory"] > 0, COV
+    if mode == "adapt" and ADAPT:
+        assert all(COV[k] > 0 for k in ("theta_sat", "theta_a_fire", "theta_a_floor", "theta_a_inc_sat")), COV
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +287,12 @@ def learn_config(rng, g: Core, mode):
         18: hi & 0xFFFF,
         19: rng.randint(1, 0xFFFF) if rst else 0,
         20: rng.choice([0, 1, 2, 3, rng.randint(0, 16), 0xFFFF if ext else 5]),
-        21: (rng.choice([64, 100, 0x8023]) if bigshift else
-             rng.choice([rng.randint(0, 12), 0xFFFF, 40, 47, 64, 100]) if ext else rng.randint(0, 12)),
+        # reward_shift <= 63: golden v0.2's rounding term 1 << (rs - 1) is int64
+        21: (rng.choice([48, 49, 63]) if bigshift else
+             rng.choice([rng.randint(0, 12), 1, 40, 47, 48, 49, 63]) if ext else rng.randint(0, 12)),
+        # plastic_axon_max (SPEC §9.3)
+        REG_PAM: rng.choice([0, 0, rng.randint(1, A - 1), rng.randint(1, A - 1), A,
+                             rng.randint(A + 1, 0xFFFF)]),
     }
     fl = [cfg(g, flits.addr_reg(r), v) for r, v in regs.items()]
     ordered = []
@@ -290,9 +332,12 @@ def learn_expected(g: Core, addr, pending_pre=frozenset()):
     if sub == DBG_XPOST:
         return int(g.x_post[idx])
     if sub == DBG_PREF:
-        return int(bool(g.pre_flag[idx]) or idx in pending_pre)
+        pam = g.regs.plastic_axon_max
+        return int(bool(g.pre_flag[idx]) or (idx in pending_pre and bool(g.regs.learn_en) and (pam == 0 or idx < pam)))
     if sub == DBG_POSTF:
         return int(g.post_flag[idx])
+    if sub == DBG_THETA_A:
+        return g.cfg_read(addr)
     if sub == DBG_MISC:
         return [g.lfsr.state, g.pending_reward & 0xFFFF, (g.pending_reward >> 16) & 0xFFFF][idx & 3]
     raise ValueError(hex(addr))

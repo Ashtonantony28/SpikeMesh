@@ -13,7 +13,7 @@
 
 module tb_replay;
     parameter integer X = 2, Y = 1, N_NEURONS = 32, N_AXONS = 32, W_BITS = 8;
-    parameter integer FANOUT_DEPTH = 64, LANES = 4, LEARN = 0;
+    parameter integer FANOUT_DEPTH = 64, LANES = 4, LEARN = 0, ADAPT_TH = 1;
 
     reg clk = 1'b0;
     always #5 clk = ~clk;
@@ -29,7 +29,7 @@ module tb_replay;
     wire        busy;
 
     neurocore #(.X(X), .Y(Y), .N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS), .W_BITS(W_BITS),
-                .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES), .LEARN(LEARN)) dut (
+                .FANOUT_DEPTH(FANOUT_DEPTH), .LANES(LANES), .LEARN(LEARN), .ADAPT_TH(ADAPT_TH)) dut (
         .clk(clk), .rst_n(rst_n), .in_valid(in_valid), .in_ready(in_ready), .in_flit(in_flit),
         .out_valid(out_valid), .out_ready(out_ready), .out_flit(out_flit), .parity(parity),
         .learn_start(learn_start), .update_start(update_start), .busy(busy));

@@ -1,7 +1,10 @@
-// SpikeMesh neurocore. Contract: docs/SPEC.md §2-§6, §8.
+// SpikeMesh neurocore. Contract: docs/SPEC.md §2-§6, §8, §9 (v0.2).
 // LEARN = 0: inference only (no learning hardware). LEARN = 1: STDP
 // (learn_engine.sv; rstdp_en is ignored). LEARN = 2: STDP + R-STDP
 // (adds the int16 eligibility memory).
+// ADAPT_TH = 1 (default): per-neuron adaptive threshold theta_a (SPEC §9.4,
+// regs 24/25, region-11 debug space 6). ADAPT_TH = 0 drops the theta_a
+// memory: theta_a is 0, regs 24/25 read 0, and space 6 reads 0.
 //
 // See rtl/core/README.md for the microarchitecture. Summary:
 //   * Input engine: one flit at a time. SPIKE = read one weight row
@@ -30,7 +33,8 @@ module neurocore #(
     // SPEC §2: W_BITS + log2(N_AXONS) + 1. Exact as long as no axon gets more
     // than two spikes in one timestep; override for heavier fan-in.
     parameter integer ACC_W          = W_BITS + $clog2(N_AXONS) + 1,
-    parameter integer LEARN          = 0
+    parameter integer LEARN          = 0,
+    parameter integer ADAPT_TH       = 1
 ) (
     input  wire        clk,
     input  wire        rst_n,
@@ -79,17 +83,23 @@ module neurocore #(
     localparam integer SF_DEPTH = 4;   // firing-neuron FIFO
 
     // ------------------------------------------------------------------
-    // Reset-time accumulator clear (SPEC §5: acc banks are control state)
+    // Reset-time clear (SPEC §5: acc banks are control state). theta_a is
+    // a memory with undefined contents per SPEC §9.4; this implementation
+    // also zeroes it here (G or N cycles after reset), so a host that never
+    // writes theta_a (v0.1 compiler output) gets the golden start value 0.
     // ------------------------------------------------------------------
+    localparam integer CLR_N = (ADAPT_TH != 0) ? N_NEURONS : G;
+    localparam [NB-1:0] CLR_LAST = NB'(CLR_N - 1);
     reg           init_busy;
-    reg [GAW-1:0] clr_g;
+    reg [NB-1:0]  clr_i;
+    wire [GAW-1:0] clr_g = clr_i[GAW-1:0];
     always @(posedge clk) begin
         if (!rst_n) begin
             init_busy <= 1'b1;
-            clr_g     <= '0;
+            clr_i     <= '0;
         end else if (init_busy) begin
-            if (clr_g == G_LAST) init_busy <= 1'b0;
-            clr_g <= clr_g + 1'b1;
+            if (clr_i == CLR_LAST) init_busy <= 1'b0;
+            clr_i <= clr_i + 1'b1;
         end
     end
 
@@ -106,6 +116,9 @@ module neurocore #(
     wire              learn_en = (LEARN != 0) && (r_lreg[0] != 16'd0);
     wire              rstdp_en = (LEARN == 2) && (r_lreg[19-8] != 16'd0);
     reg               r_dbg_elig;      // reg 22 (LEARN == 2): region 00 addresses e[a][n]
+    reg        [15:0] r_pam;           // reg 23 plastic_axon_max
+    reg        [15:0] r_th_inc;        // reg 24 (ADAPT_TH only)
+    reg        [3:0]  r_th_dshift;     // reg 25 (ADAPT_TH only)
 
     // 32-bit index temporaries below are sliced; their upper bits are unused.
     /* verilator lint_off UNUSEDSIGNAL */
@@ -148,6 +161,10 @@ module neurocore #(
                              (((d_region == 2'd3) && (d_sub >= 4'd1) && (d_sub <= 4'd4)) ||
                               ((d_region == 2'd0) && r_dbg_elig));
     wire [2:0]    d_ldsel  = (d_region == 2'd0) ? 3'd0 : d_sub[2:0];
+    // theta_a debug space: region 11, sub 6, index n = [15:0]
+    wire          d_ta     = (d_region == 2'd3) && (d_sub == 4'd6);
+    wire          d_ta_ok  = (dec_addr[15:0] < 16'(N_NEURONS));
+    wire [NB-1:0] d_ta_n   = dec_addr[NB-1:0];
 
     /* verilator lint_on UNUSEDSIGNAL */
     // core register read mux (combinational, indexed by the incoming flit)
@@ -172,6 +189,9 @@ module neurocore #(
             default:
                 if (d_reg >= 8'd8 && d_reg <= 8'd21) d_regval = r_lreg[4'(d_reg - 8'd8)];
                 else if (d_reg == 8'd22) d_regval = {15'd0, r_dbg_elig};
+                else if (d_reg == 8'd23) d_regval = r_pam;
+                else if (d_reg == 8'd24) d_regval = r_th_inc;
+                else if (d_reg == 8'd25) d_regval = {12'd0, r_th_dshift};
         endcase
     end
 
@@ -195,6 +215,9 @@ module neurocore #(
     reg              fd_we, fa_we; reg [FAW-1:0] f_waddr;
     reg [7:0]        fd_wdata; reg [9:0] fa_wdata;
     wire [7:0]       fd_rdata; wire [9:0] fa_rdata;
+    // adaptive threshold theta_a[n] (ADAPT_TH)
+    reg              ta_we, ta_re; reg [NB-1:0] ta_waddr, ta_raddr; reg [15:0] ta_wdata;
+    wire [15:0]      ta_rdata;
 
     sram_1r1w #(.DEPTH(WDEPTH), .WIDTH(WROW), .NLANE(LANES)) u_wmem (
         .clk(clk), .we(w_we), .wmask(w_wmask), .waddr(w_waddr), .wdata(w_wdata),
@@ -227,6 +250,18 @@ module neurocore #(
     sram_1r1w #(.DEPTH(FANOUT_DEPTH), .WIDTH(10), .NLANE(1)) u_foaxon (
         .clk(clk), .we(fa_we), .wmask(1'b1), .waddr(f_waddr), .wdata(fa_wdata),
         .re(f_re), .raddr(f_raddr), .rdata(fa_rdata));
+    generate
+        if (ADAPT_TH != 0) begin : g_ta
+            sram_1r1w #(.DEPTH(N_NEURONS), .WIDTH(16), .NLANE(1)) u_theta_a (
+                .clk(clk), .we(ta_we), .wmask(1'b1), .waddr(ta_waddr), .wdata(ta_wdata),
+                .re(ta_re), .raddr(ta_raddr), .rdata(ta_rdata));
+        end else begin : g_nota
+            assign ta_rdata = 16'd0;
+            /* verilator lint_off UNUSEDSIGNAL */
+            wire unused_ta = ta_we | ta_re | (|ta_waddr) | (|ta_raddr) | (|ta_wdata);
+            /* verilator lint_on UNUSEDSIGNAL */
+        end
+    endgenerate
 
     // ------------------------------------------------------------------
     // Control state
@@ -247,6 +282,7 @@ module neurocore #(
     reg [15:0]    rd_addr16, rd_regval;
     reg [3:0]     rd_rx, rd_ry;
     reg           rd_dbg;
+    reg           rd_ta;
     reg [47:0]    rd_resp;
     // learning
     reg           learn_pending;
@@ -340,8 +376,18 @@ module neurocore #(
     wire signed [15:0]      c_v2     = (c_sum > 20'sd32767)  ? 16'sh7fff :
                                        (c_sum < -20'sd32768) ? 16'sh8000 : c_sum[15:0];
     wire                    c_refr   = (rc_rdata != 4'd0);
-    wire                    c_fire   = !c_refr && (c_v2 >= r_theta);
-    wire signed [15:0]      c_vreset = r_reset_mode ? 16'sd0 : (c_v2 - r_theta);
+    // SPEC §9.4: theta_eff = min(32767, theta + theta_a[n])
+    wire [15:0]             c_ta     = ta_rdata;
+    wire signed [17:0]      c_thsum  = {{2{r_theta[15]}}, r_theta} + {2'b00, c_ta};
+    wire signed [15:0]      c_theta  = (c_thsum > 18'sd32767) ? 16'sh7fff : c_thsum[15:0];
+    wire                    c_fire   = !c_refr && (c_v2 >= c_theta);
+    wire signed [15:0]      c_vreset = r_reset_mode ? 16'sd0 : (c_v2 - c_theta);
+    // theta_a: decay with floor (§9.1), then + th_inc (saturating) if the neuron fired
+    wire [15:0]             c_ta_sh  = c_ta >> r_th_dshift;
+    wire [15:0]             c_ta_dec = ((r_th_dshift == 4'd0) || (c_ta == 16'd0)) ? c_ta :
+                                       (c_ta - ((c_ta_sh == 16'd0) ? 16'd1 : c_ta_sh));
+    wire [16:0]             c_ta_inc = {1'b0, c_ta_dec} + {1'b0, r_th_inc};
+    wire [15:0]             c_ta_new = !c_fire ? c_ta_dec : (c_ta_inc[16] ? 16'hFFFF : c_ta_inc[15:0]);
     wire signed [15:0]      c_vkeep  = (c_v2 > r_vmin) ? c_v2 : r_vmin;
     wire [15:0]             c_vnew   = c_refr ? cv : (c_fire ? c_vreset : c_vkeep);
     wire [3:0]              c_rcnew  = c_refr ? (rc_rdata - 4'd1) : (c_fire ? r_refrac : 4'd0);
@@ -360,6 +406,8 @@ module neurocore #(
     wire [15:0]   le_dbg_rdata;
     wire          ld_we = acc_cfg && d_ldbg;
     wire          ld_re = acc_rd && d_ldbg;
+    // SPEC §9.3: a spike on a non-plastic axon never sets pre_flag (only pre_seen)
+    wire          in_plastic = (r_pam == 16'd0) || ({{(16-AB){1'b0}}, in_axon} < r_pam);
     generate
         if (LEARN != 0) begin : g_learn
             learn_engine #(.N_NEURONS(N_NEURONS), .N_AXONS(N_AXONS), .W_BITS(W_BITS),
@@ -369,10 +417,11 @@ module neurocore #(
                 .tau_pre(r_lreg[12-8]), .tau_post(r_lreg[13-8]), .inc_pre(r_lreg[14-8]),
                 .inc_post(r_lreg[15-8]), .w_min(r_lreg[17-8]), .w_max(r_lreg[18-8]),
                 .rstdp_en(rstdp_en), .tau_elig(r_lreg[20-8]), .reward_shift(r_lreg[21-8]),
+                .plastic_max(r_pam),
                 .lfsr_load(acc_cfg && (d_region == 2'd3) && (d_sub == 4'd0) && (d_reg == 8'd16)),
                 .lfsr_seed(cfg_data), .lfsr(le_lfsr),
                 .reward(reward_acc), .reward_clr(le_reward_clr),
-                .pre_set(acc_spk && learn_en), .pre_axon(in_axon),
+                .pre_set(acc_spk && learn_en), .pre_plastic(in_plastic), .pre_axon(in_axon),
                 .post_wr(c_valid && learn_en), .post_n(c_n), .post_fire(c_fire),
                 .w_re(le_w_re), .w_raddr(le_w_raddr), .w_rdata(w_rdata),
                 .w_we(le_w_we), .w_wmask(le_w_wmask), .w_waddr(le_w_waddr), .w_wdata(le_w_wdata),
@@ -384,7 +433,7 @@ module neurocore #(
             assign le_w_wmask = '0; assign le_w_wdata = '0; assign le_dbg_rdata = 16'd0;
             assign le_lfsr = 16'd0;
             /* verilator lint_off UNUSEDSIGNAL */
-            wire unused_nl = learn_en | rstdp_en | ld_we | ld_re | (|d_ldsel);
+            wire unused_nl = learn_en | rstdp_en | ld_we | ld_re | (|d_ldsel) | in_plastic;
             /* verilator lint_on UNUSEDSIGNAL */
         end
     endgenerate
@@ -488,6 +537,13 @@ module neurocore #(
         f_waddr  = d_f;
         fd_wdata = cfg_data[15:8];
         fa_wdata = cfg_data[9:0];
+
+        // theta_a: UPDATE reads/writes it alongside v; CFG / READ via space 6
+        ta_re    = u_issue || (acc_rd && d_ta);
+        ta_raddr = upd_active ? r_n[NB-1:0] : d_ta_n;
+        ta_we    = init_busy || c_valid || (acc_cfg && d_ta && d_ta_ok);
+        ta_waddr = init_busy ? clr_i : c_valid ? c_n : d_ta_n;
+        ta_wdata = init_busy ? 16'd0 : c_valid ? c_ta_new : cfg_data;
     end
 
     // ------------------------------------------------------------------
@@ -498,6 +554,7 @@ module neurocore #(
     always @* begin
         rd_data = 16'd0;
         if (rd_dbg) rd_data = le_dbg_rdata;
+        else if (rd_ta) rd_data = rd_ok ? ta_rdata : 16'd0;
         else case (rd_region)
             2'd0: if (rd_ok) rd_data = {{(16-W_BITS){rd_w[W_BITS-1]}}, rd_w};
             2'd1: if (rd_ok) case (rd_field)
@@ -528,6 +585,9 @@ module neurocore #(
             learn_pending <= 1'b0;
             reward_acc  <= 32'sd0;
             r_dbg_elig  <= 1'b0;
+            r_pam       <= 16'd0;
+            r_th_inc    <= 16'd0;
+            r_th_dshift <= 4'd0;
             upd_pending <= 1'b0;
             upd_active  <= 1'b0;
             upd_par     <= 1'b0;
@@ -567,10 +627,11 @@ module neurocore #(
                         rd_lane   <= d_w_lane;
                         rd_ok     <= (d_region == 2'd0) ? d_w_ok :
                                      (d_region == 2'd1) ? d_n_ok :
-                                     (d_region == 2'd2) ? d_f_ok : 1'b1;
+                                     (d_region == 2'd2) ? d_f_ok : (d_ta ? d_ta_ok : 1'b1);
                         rd_addr16 <= dec_addr[15:0];
                         rd_regval <= d_regval;
                         rd_dbg    <= d_ldbg;
+                        rd_ta     <= d_ta;
                         rd_rx     <= in_flit[14:11];
                         rd_ry     <= in_flit[10:7];
                         st        <= S_RDW;
@@ -587,6 +648,12 @@ module neurocore #(
                                     r_lreg[4'(d_reg - 8'd8)] <= cfg_data;
                                 else if (d_reg == 8'd22 && LEARN == 2)
                                     r_dbg_elig <= cfg_data[0];
+                                else if (d_reg == 8'd23)
+                                    r_pam <= cfg_data;
+                                else if (d_reg == 8'd24 && ADAPT_TH != 0)
+                                    r_th_inc <= cfg_data;
+                                else if (d_reg == 8'd25 && ADAPT_TH != 0)
+                                    r_th_dshift <= cfg_data[3:0];
                         endcase
                     end
                 end
@@ -611,10 +678,11 @@ module neurocore #(
             s2_fwd      <= spk_issue && s2_valid && (s2_bank == spk_issue_bank) && (s2_g == spk_issue_g);
             s2_fwd_data <= s2_sum;
 
-            // CTRL REWARD (accepted in any state where in_ready is high)
+            // CTRL REWARD (accepted in any state where in_ready is high);
+            // dropped unless learn_en and rstdp_en are both set (SPEC §9.5)
             if (le_reward_clr)
                 reward_acc <= 32'sd0;
-            else if (accept && is_ctrl && (in_flit[7:0] == 8'h01))
+            else if (accept && is_ctrl && (in_flit[7:0] == 8'h01) && learn_en && rstdp_en)
                 reward_acc <= reward_acc + {{16{in_flit[23]}}, in_flit[23:8]};
 
             // ---------------- learn ----------------

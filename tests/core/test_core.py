@@ -30,6 +30,9 @@ CONFIGS = {
     "l1_l2": dict(N=16, A=32, LANES=1, W=8, FD=32, LEARN=2),
     "rect_l2": dict(N=64, A=16, LANES=2, W=8, FD=128, LEARN=2),
     "big_l2": dict(N=256, A=256, LANES=8, W=8, FD=1024, LEARN=2),
+    # ADAPT_TH = 0: no theta_a memory (regs 24/25 and theta_a read 0, writes ignored)
+    "small_na": dict(N=32, A=32, LANES=4, W=8, FD=64, ADAPT=0),
+    "small_l2_na": dict(N=32, A=32, LANES=4, W=8, FD=64, LEARN=2, ADAPT=0),
 }
 X, Y = 2, 1
 _runners: dict = {}
@@ -42,13 +45,14 @@ def _run(sim, cfg_name, testcase, **env):
     if runner is None:
         runner = get_runner(sim)
         params = dict(X=X, Y=Y, N_NEURONS=c["N"], N_AXONS=c["A"], W_BITS=c["W"],
-                      FANOUT_DEPTH=c["FD"], LANES=c["LANES"], LEARN=c.get("LEARN", 0))
+                      FANOUT_DEPTH=c["FD"], LANES=c["LANES"], LEARN=c.get("LEARN", 0),
+                      ADAPT_TH=c.get("ADAPT", 1))
         build_args = ["-Wno-fatal"] if sim == "verilator" else []
         runner.build(sources=RTL, hdl_toplevel="neurocore", parameters=params,
                      build_dir=bdir, always=True, build_args=build_args, timescale=("1ns", "1ps"))
         _runners[(sim, cfg_name)] = runner
     full_env = {"N": c["N"], "A": c["A"], "LANES": c["LANES"], "W": c["W"], "FD": c["FD"], "X": X, "Y": Y,
-                "LEARN": c.get("LEARN", 0)}
+                "LEARN": c.get("LEARN", 0), "ADAPT": c.get("ADAPT", 1)}
     full_env.update(env)
     full_env = {k: str(v) for k, v in full_env.items()}
     full_env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "tests/core"), os.environ.get("PYTHONPATH", "")])
@@ -109,11 +113,25 @@ def test_big_cycles():
     _run("icarus", "big", "test_cycles", SEED=1)
 
 
+# ---------------- SPEC v0.2 adaptive threshold (§9.4) ----------------
+@pytest.mark.parametrize("cfg,seed", [("small", 201), ("small", 202), ("small", 203), ("l1", 204), ("g1", 205)])
+def test_adapt(cfg, seed):
+    _run("icarus", cfg, "test_random", SEED=seed, MODE="adapt", STEPS=24, BP=0.3)
+
+
+def test_adapt_th0_build():
+    """ADAPT_TH = 0: theta_a writes and regs 24/25 are ignored (golden keeps theta_a = 0)."""
+    _run("icarus", "small_na", "test_random", SEED=211, MODE="adapt", STEPS=16, BP=0.3)
+    _run("icarus", "small_na", "test_cfg_readback", SEED=212, BP=0.3)
+    _run("icarus", "small_l2_na", "test_learn", SEED=213, MODE="rstdp", STEPS=8, BP=0.3)
+
+
 # ---------------- on-chip learning (SG6) ----------------
 @pytest.mark.parametrize("seed,mode", [
     (101, "stdp"), (102, "stdp"), (103, "stdp_s0"), (104, "stdp_ext"),
     (105, "rstdp"), (106, "rstdp"), (107, "rstdp_s0"), (108, "rstdp_ext"),
     (109, "stdp_bigshift"), (110, "rstdp_bigshift"),
+    (161, "stdp"), (162, "rstdp"), (163, "rstdp_ext"), (164, "rstdp"),
 ])
 def test_learn_small(seed, mode):
     _run("icarus", "small_l2", "test_learn", SEED=seed, MODE=mode, STEPS=10, BP=0.3)
@@ -158,13 +176,13 @@ def _vl(cfg_name, **env):
                "-j", "4", "--top-module", "tb_replay", "-Mdir", str(work / "obj"), "-o", "Vtb",
                f"-GX={X}", f"-GY={Y}", f"-GN_NEURONS={c['N']}", f"-GN_AXONS={c['A']}",
                f"-GW_BITS={c['W']}", f"-GFANOUT_DEPTH={c['FD']}", f"-GLANES={c['LANES']}",
-               f"-GLEARN={c.get('LEARN', 0)}",
+               f"-GLEARN={c.get('LEARN', 0)}", f"-GADAPT_TH={c.get('ADAPT', 1)}",
                str(ROOT / "tests/core/tb_replay.sv"), *map(str, RTL)]
         subprocess.run(cmd, check=True, capture_output=True, timeout=600)
         _vl_bins[cfg_name] = work / "obj" / "Vtb"
     full_env = dict(os.environ)
     full_env.update({"N": c["N"], "A": c["A"], "LANES": c["LANES"], "W": c["W"], "FD": c["FD"],
-                     "X": X, "Y": Y, "LEARN": c.get("LEARN", 0), **env})
+                     "X": X, "Y": Y, "LEARN": c.get("LEARN", 0), "ADAPT": c.get("ADAPT", 1), **env})
     full_env = {k: str(v) for k, v in full_env.items()}
     full_env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(ROOT / "tests/core")])
     r = subprocess.run([sys.executable, str(ROOT / "tests/core/vl_replay.py"), str(_vl_bins[cfg_name]), str(work)],

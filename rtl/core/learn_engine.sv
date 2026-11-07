@@ -1,4 +1,8 @@
-// SpikeMesh on-chip learning engine (SG6). Contract: docs/SPEC.md §6.
+// SpikeMesh on-chip learning engine (SG6). Contract: docs/SPEC.md §6, with
+// the v0.2 changes of §9: trace decay floor max(1, x >> k), rounded reward,
+// non-plastic axons (an arrival on a >= plastic_axon_max sets only pre_seen,
+// which drives the x_pre bump; pre_flag, which drives depression, stays clear;
+// POT draws sr() for them but does not write).
 //
 // Instantiated by neurocore only when LEARN > 0. Owns the learning state:
 // x_pre[A] / x_post[N] traces (uint8, sram_1r1w), pre_flag[A] / post_flag[N]
@@ -41,13 +45,15 @@ module learn_engine #(
     input  wire               rstdp_en,       // already gated with RSTDP
     input  wire [15:0]        tau_elig,
     input  wire [15:0]        reward_shift,
+    input  wire [15:0]        plastic_max,    // reg 23: 0 = all axons plastic
     input  wire               lfsr_load,      // CFG write of lfsr_seed
     input  wire [15:0]        lfsr_seed,
     output reg  [15:0]        lfsr,
     input  wire signed [31:0] reward,
     output reg                reward_clr,
     // spike events
-    input  wire               pre_set,
+    input  wire               pre_set,        // spike arrival (learn_en)
+    input  wire               pre_plastic,    // ... on a plastic axon
     input  wire [$clog2(N_AXONS)-1:0]   pre_axon,
     input  wire               post_wr,
     input  wire [$clog2(N_NEURONS)-1:0] post_n,
@@ -118,12 +124,21 @@ module learn_engine #(
         end
     endfunction
 
-    function automatic [15:0] clamp49(input signed [48:0] v, input signed [15:0] lo, input signed [15:0] hi);
-        reg signed [48:0] t;
+    function automatic [15:0] clamp50(input signed [49:0] v, input signed [15:0] lo, input signed [15:0] hi);
+        reg signed [49:0] t;
         begin
-            t = (v < 49'(lo)) ? 49'(lo) : v;
-            t = (t > 49'(hi)) ? 49'(hi) : t;
-            clamp49 = t[15:0];
+            t = (v < 50'(lo)) ? 50'(lo) : v;
+            t = (t > 50'(hi)) ? 50'(hi) : t;
+            clamp50 = t[15:0];
+        end
+    endfunction
+
+    // SPEC §9.1 trace decay: x -= max(1, x >> k) when x > 0 and k > 0
+    function automatic [7:0] decay8(input [7:0] x, input [3:0] k);
+        reg [7:0] d;
+        begin
+            d = x >> k;
+            decay8 = (k == 4'd0 || x == 8'd0) ? x : (x - ((d == 8'd0) ? 8'd1 : d));
         end
     endfunction
 
@@ -131,12 +146,15 @@ module learn_engine #(
     wire [3:0] tpre_eff  = (tau_pre  > 16'd8) ? 4'd8 : tau_pre[3:0];
     wire [3:0] tpost_eff = (tau_post > 16'd8) ? 4'd8 : tau_post[3:0];
     wire [3:0] telig_eff = (tau_elig > 16'd15) ? 4'd15 : tau_elig[3:0];
-    wire [5:0] rs_eff    = (reward_shift > 16'd47) ? 6'd47 : reward_shift[5:0];
+    // |r * e| < 2^47, so any shift >= 48 gives 0 even with the rounding term
+    wire [5:0] rs_eff    = (reward_shift > 16'd48) ? 6'd48 : reward_shift[5:0];
+    wire signed [49:0] rs_half = (rs_eff == 6'd0) ? 50'sd0 : (50'sd1 <<< (rs_eff - 6'd1));
 
     // ------------------------------------------------------------------
     // Flags
     // ------------------------------------------------------------------
     reg [N_AXONS-1:0]   pre_flag;
+    reg [N_AXONS-1:0]   pre_seen;   // any arrival (plastic or not): x_pre bump
     reg [N_NEURONS-1:0] post_flag;
 
     // ------------------------------------------------------------------
@@ -186,6 +204,7 @@ module learn_engine #(
     reg [CW-1:0]  k_i;
     reg [WAW-1:0] k_row;
     reg [LBW-1:0] k_lane;
+    reg           k_fixed;      // POT: axon k is non-plastic (sr drawn, no write)
 
     wire use_e = rstdp_en;
     assign busy = (ph != P_IDLE) || start;
@@ -242,11 +261,11 @@ module learn_engine #(
     reg [24:0] dlt;
     reg signed [15:0] tgt, ev, ed;
     reg signed [47:0] prod;
-    reg signed [48:0] dw;
+    reg signed [49:0] dw;
     reg [8:0] xb;
     always @* begin
         xl = 8'd0; m = 24'd0; dlt = 25'd0; tgt = 16'sd0; ev = 16'sd0; ed = 16'sd0;
-        prod = 48'sd0; dw = 49'sd0; xb = 9'd0; xp_res = 8'd0;
+        prod = 48'sd0; dw = 50'sd0; xb = 9'd0; xp_res = 8'd0;
         stdp_res = '0; elig_res = '0; rw_res = '0; xq_res = '0;
         for (l = 0; l < LANES; l = l + 1) begin
             // STDP (DEP: all lanes; POT: lane k_lane is the one written)
@@ -257,18 +276,18 @@ module learn_engine #(
                         : $signed({{(16-W_BITS){w_rdata[l*W_BITS + W_BITS - 1]}}, w_rdata[l*W_BITS +: W_BITS]});
             stdp_res[l*16 +: 16] = is_dep ? clamp27(27'(tgt) - $signed({2'b00, dlt}), lo, hi)
                                           : clamp27(27'(tgt) + $signed({2'b00, dlt}), lo, hi);
-            // ELIG pass: e -= e >>> tau_elig; w = clamp(w + (r*e >>> reward_shift))
+            // ELIG pass: e -= e >>> tau_elig; w = clamp(w + ((r*e + half) >>> reward_shift))
             ev = $signed(e_rdata[l*16 +: 16]);
             ed = (tau_elig == 16'd0) ? ev : (ev - (ev >>> telig_eff));
             elig_res[l*16 +: 16] = ed;
             prod = r_snap * ed;
-            dw   = $signed({prod[47], prod}) >>> rs_eff;
-            rw_res[l*16 +: 16] = clamp49(dw + 49'($signed({{(16-W_BITS){w_rdata[l*W_BITS + W_BITS - 1]}},
+            dw   = ($signed({{2{prod[47]}}, prod}) + rs_half) >>> rs_eff;
+            rw_res[l*16 +: 16] = clamp50(dw + 50'($signed({{(16-W_BITS){w_rdata[l*W_BITS + W_BITS - 1]}},
                                                                 w_rdata[l*W_BITS +: W_BITS]})), w_min, w_max);
             // x_post decay / bump
             xl = xq_rdata[l*8 +: 8];
             if (k_ph == P_DECAY)
-                xq_res[l*8 +: 8] = (tau_post == 16'd0) ? xl : (xl - (xl >> tpost_eff));
+                xq_res[l*8 +: 8] = decay8(xl, (tau_post == 16'd0) ? 4'd0 : tpost_eff);
             else begin
                 xb = {1'b0, xl} + ((inc_post > 16'd255) ? 9'd255 : inc_post[8:0]);
                 xq_res[l*8 +: 8] = (post_flag[(k_i32 * LANES + l) % N_NEURONS] && (k_i32 < 32'(G)))
@@ -276,10 +295,10 @@ module learn_engine #(
             end
         end
         if (k_ph == P_DECAY)
-            xp_res = (tau_pre == 16'd0) ? xp_rdata : (xp_rdata - (xp_rdata >> tpre_eff));
+            xp_res = decay8(xp_rdata, (tau_pre == 16'd0) ? 4'd0 : tpre_eff);
         else begin
             xb = {1'b0, xp_rdata} + ((inc_pre > 16'd255) ? 9'd255 : inc_pre[8:0]);
-            xp_res = (pre_flag[k_i32 % N_AXONS] && (k_i32 < 32'(N_AXONS)))
+            xp_res = (pre_seen[k_i32 % N_AXONS] && (k_i32 < 32'(N_AXONS)))
                      ? ((xb > 9'd255) ? 8'd255 : xb[7:0]) : xp_rdata;
         end
     end
@@ -330,7 +349,8 @@ module learn_engine #(
         // weight memory
         w_re    = issue && ((ph == P_ELIG) || (((ph == P_DEP) || (ph == P_POT)) && !use_e));
         w_raddr = (ph == P_ELIG) ? cnt[WAW-1:0] : (ph == P_DEP) ? dep_row32[WAW-1:0] : pot_row32[WAW-1:0];
-        w_we    = k_valid && (((k_ph == P_ELIG) && apply_rw) || (((k_ph == P_DEP) || (k_ph == P_POT)) && !use_e));
+        w_we    = k_valid && (((k_ph == P_ELIG) && apply_rw) || (k_ph == P_DEP && !use_e) ||
+                              ((k_ph == P_POT) && !use_e && !k_fixed));
         w_wmask = (k_ph == P_POT) ? ({{(LANES-1){1'b0}}, 1'b1} << k_lane) : {LANES{1'b1}};
         w_waddr = k_row;
         w_wdata = (k_ph == P_ELIG) ? rw_w : stdp_w;
@@ -338,7 +358,8 @@ module learn_engine #(
         e_re    = (issue && ((ph == P_ELIG) || (((ph == P_DEP) || (ph == P_POT)) && use_e))) ||
                   (dbg_re && dbg_sel == 3'd0);
         e_raddr = issue ? w_raddr : di_row[WAW-1:0];
-        e_we    = (k_valid && ((k_ph == P_ELIG) || (((k_ph == P_DEP) || (k_ph == P_POT)) && use_e))) ||
+        e_we    = (k_valid && ((k_ph == P_ELIG) || ((k_ph == P_DEP) && use_e) ||
+                               ((k_ph == P_POT) && use_e && !k_fixed))) ||
                   (dbg_we && dbg_sel == 3'd0 && di_e_ok);
         e_wmask = k_valid ? w_wmask : di_mask;
         e_waddr = k_valid ? k_row : di_row[WAW-1:0];
@@ -371,14 +392,17 @@ module learn_engine #(
         if (!rst_n) begin
             ph <= P_IDLE; issue_done <= 1'b0; cnt <= '0; d_a <= '0; d_g <= '0;
             p_n <= '0; p_a <= '0; in_run <= 1'b0; apply_rw <= 1'b0; r_snap <= 32'sd0;
-            k_valid <= 1'b0; k_ph <= P_IDLE; k_i <= '0; k_row <= '0; k_lane <= '0;
+            k_valid <= 1'b0; k_ph <= P_IDLE; k_i <= '0; k_row <= '0; k_lane <= '0; k_fixed <= 1'b0;
             lfsr <= 16'd1; reward_clr <= 1'b0;
-            pre_flag <= '0; post_flag <= '0;
+            pre_flag <= '0; pre_seen <= '0; post_flag <= '0;
             dq_sel <= 3'd0; dq_ok <= 1'b0; dq_lane <= '0; dq_flag <= 1'b0;
         end else begin
             reward_clr <= 1'b0;
             // flags from the spike / update datapaths
-            if (pre_set) pre_flag[pre_axon] <= 1'b1;
+            if (pre_set) begin
+                pre_seen[pre_axon] <= 1'b1;
+                if (pre_plastic) pre_flag[pre_axon] <= 1'b1;
+            end
             if (post_wr) post_flag[post_n] <= post_fire;
             // debug read capture
             if (dbg_re) begin
@@ -398,6 +422,7 @@ module learn_engine #(
             k_i     <= cnt;
             k_row   <= (ph == P_ELIG) ? cnt[WAW-1:0] : (ph == P_DEP) ? dep_row32[WAW-1:0] : pot_row32[WAW-1:0];
             k_lane  <= pot_l32[LBW-1:0];
+            k_fixed <= (plastic_max != 16'd0) && ({{(16-AB){1'b0}}, p_a} >= plastic_max);
 
             case (ph)
                 P_IDLE: if (start) begin
@@ -417,7 +442,7 @@ module learn_engine #(
                         issue_done <= 1'b0; cnt <= '0;
                         if (ph == P_DECAY && elig_needed) ph <= P_ELIG;
                         else if (ph == P_BUMP) begin
-                            ph <= P_IDLE; pre_flag <= '0; post_flag <= '0;
+                            ph <= P_IDLE; pre_flag <= '0; pre_seen <= '0; post_flag <= '0;
                         end else begin
                             if (ph == P_ELIG && apply_rw) reward_clr <= 1'b1;
                             ph <= P_DEP; d_a <= '0; in_run <= 1'b0;

@@ -112,7 +112,7 @@ Reset values: only control state (FSMs, accumulator banks, learning flags and tr
 
 Region 11 debug spaces (`[19:16]` selects; space 0 is the core registers above and requires `[19:16] = 0`): 1 `x_pre[a]` (r/w), 2 `x_post[n]` (r/w), 3 `pre_flag[a]` (r), 4 `post_flag[n]` (r), 5 index 0 LFSR state, 1/2 low/high half of the pending reward sum (r). Register 22 bit 0 (R-STDP builds only): region-00 accesses go to the eligibility memory instead of the weights.
 
-Implementation limits: the pending reward sum is 32-bit signed; `w_min`/`w_max` must fit in `W_BITS`; `stdp_shift` ≤ 63 in tests (the golden mask is int64).
+Implementation limits: the pending reward sum is 32-bit signed; `w_min`/`w_max` must fit in `W_BITS`; `stdp_shift` ≤ 63 and `reward_shift` ≤ 63 in tests (golden uses int64). After reset the RTL zeroes `theta_a` (golden also starts at 0); hosts should still write it.
 
 A neuron with fan-out count 0 sends nothing. A neuron's fan-out entries are `base .. base + count - 1`, sent in ascending order.
 

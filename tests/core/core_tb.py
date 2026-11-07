@@ -20,7 +20,7 @@ from golden.spikemesh import Core, REG_INDEX
 from core_model import (N, A, W, FD, CX, CY, G, SEED, STEPS, MODE, BP, IN_GAP, COV, LANES, LEARN,
                         cfg, all_weight_flits, random_network, golden_step, make_events,
                         state_addrs, check_coverage, learn_config, learn_light_addrs, learn_expected,
-                        REG_DBG_ELIG)
+                        REG_DBG_ELIG, ADAPT, DBG_THETA_A, DBG_MISC, REG_TH_DSHIFT, dbg_addr)
 
 class Harness:
     """Single-coroutine cycle driver: drive on the falling edge, sample after
@@ -174,6 +174,9 @@ async def test_random(dut):
     await h.idle(2)
     h.tag = -2
     await check_state(h, g, rng)
+    if LEARN:   # learn_en = 0 here: every REWARD must have been dropped (SPEC §9.5)
+        got = await h.read([dbg_addr(DBG_MISC, 1), dbg_addr(DBG_MISC, 2)])
+        assert got == [g.pending_reward & 0xFFFF, (g.pending_reward >> 16) & 0xFFFF] == [0, 0], got
     dut._log.info(f"MODE={MODE} SEED={SEED} N={N} A={A} LANES={LANES}: {STEPS} steps, "
                   f"{total_out} output flits, {h.cycles} cycles total; coverage {dict(COV)}")
     check_coverage()
@@ -193,7 +196,7 @@ async def test_cfg_readback(dut):
     fl = []
     for r in regs:
         name = REG_INDEX.get(r)
-        if name in ("leak_shift", "refrac"):
+        if name in ("leak_shift", "refrac") or r == REG_TH_DSHIFT:
             v = rng.randint(0, 15)
         elif name == "reset_mode":
             v = rng.randint(0, 1)
@@ -212,12 +215,17 @@ async def test_cfg_readback(dut):
     for e in range(FD):
         for wd in range(2):
             fl.append(cfg(g, flits.addr_fanout(e, wd), rng.randint(0, 0xFFFF)))
+    # theta_a (SPEC §9.4): every neuron, plus out-of-range indices (ignored)
+    ta_idx = list(range(N)) + [N, N + 3, 0xFFFF]
+    for n in ta_idx:
+        fl.append(cfg(g, dbg_addr(DBG_THETA_A, n), rng.randint(0, 0xFFFF)))
     rng.shuffle(fl)
     await h.send(fl)
     addrs = [flits.addr_reg(r) for r in regs]
     addrs += [flits.addr_weight(a, n, N) for a in range(A) for n in range(N)]
     addrs += [flits.addr_neuron(n, f) for n in range(N) for f in range(4)]
     addrs += [flits.addr_fanout(e, wd) for e in range(FD) for wd in range(2)]
+    addrs += [dbg_addr(DBG_THETA_A, n) for n in ta_idx]
     rng.shuffle(addrs)
     got = await h.read(addrs, 15, 0)
     exp = [g.cfg_read(a) for a in addrs]
@@ -312,9 +320,22 @@ async def test_learn(dut):
     early = False
     learn_log = []
     full_every = int(os.environ.get("FULL_EVERY", 3))
+    orig_learn, orig_rstdp = g.regs.learn_en, g.regs.rstdp_en
+    toggles = Counter()
     for t in range(STEPS):
         p = t & 1
         h.parity = p
+        # SPEC §9.5: switch R-STDP / learning off and on between steps, so some
+        # rewards arrive while off (dropped). learn_en only changes when no
+        # spike for this step was delivered early (golden takes spikes at step time).
+        if t > 0 and MODE.startswith("rstdp") and rng.random() < 0.3:
+            v = rng.choice([0, orig_rstdp])
+            toggles["rstdp_en=%d" % bool(v)] += 1
+            h.in_q.append(cfg(g, flits.addr_reg(19), v))
+        if t > 0 and not early and not loop_next and rng.random() < 0.2:
+            v = rng.choice([0, orig_learn])
+            toggles["learn_en=%d" % bool(v)] += 1
+            h.in_q.append(cfg(g, flits.addr_reg(8), v))
         if not early:
             h.in_q.extend(flits.spike(CX, CY, a, p) for a in events[t])
         for _ in range(rng.choice([0, 0, 1, 2])):
@@ -359,4 +380,4 @@ async def test_learn(dut):
         await check_learn_state(h, g, rng, pending, full, None if A * N <= 4096 else 1024)
     dut._log.info(f"LEARN MODE={MODE} SEED={SEED} N={N} A={A} LANES={LANES} W={W} LEARN={LEARN}: "
                   f"{STEPS} steps OK; LEARN cycles (cycles, #pre, #post) {learn_log}; "
-                  f"lfsr={g.lfsr.state:#06x} reward={g.pending_reward}")
+                  f"lfsr={g.lfsr.state:#06x} reward={g.pending_reward}; toggles {dict(toggles)}")
