@@ -19,6 +19,6 @@ Full rationale: `/mnt/project-files/project-plans/neuromorphic-snn-chip-PLAN.md`
 | SG5 | Integration: full chip RTL (Verilator) == golden | tests/system/ | trained net bit-exact end-to-end |
 | SG6 | On-chip learning RTL (STDP, R-STDP) | rtl/core/ | weights after learning == golden |
 | SG7 | FPGA top for KV260, Yosys resource report, host API | fpga/, host/ | synth clean; resource table |
-| SG8 | Final audit + README | — | no critical/high findings; loop ends here |
+| SG8 | Final audit + README | docs/AUDIT-1.md | done 2026-11-07: 2 high fixed, 0 critical; project closed at this audit |
 
 Deferred to Ashton's hardware: M5/M6/M8 board runs, real DVS Gesture, live demo, M9 GDS run.

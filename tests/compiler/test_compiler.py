@@ -200,7 +200,7 @@ def test_every_cfg_flit_decodes_to_valid_core_and_region():
         elif (low >> 16) == 6:                       # v0.2 debug space 6: theta_a[n] = 0
             assert s is not None and (low & 0xFFFF) < s.n and d["data"] == 0
         else:
-            assert low in (0, 1, 2, 3, 4, 8, 23, 24, 25)
+            assert low in (0, 1, 2, 3, 4, 8, 22, 23, 24, 25)
             if low in (23, 24, 25):
                 assert d["data"] == 0
     assert seen_cores == {(x, y) for x in range(3) for y in range(3)}

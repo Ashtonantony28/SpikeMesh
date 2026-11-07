@@ -282,7 +282,9 @@ def compile_net(net: NetIR, mesh_x: int, mesh_y: int, n_neurons: int = 256, n_ax
     dense_weights: True (default, safe) writes every synapse of the used block
         (rows 0..n_in-1, columns 0..slice-1), zeros included, so no weight
         memory reset is assumed. False writes only nonzero weights and ASSUMES
-        weight memory is zero after reset.
+        weight memory is all zero. The RTL never resets weight SRAM, so this is
+        only valid right after an FPGA bitstream load (BRAM initialised to 0) or
+        in Verilator; never after rst_n/soft reset or on an ASIC (AUDIT-1 M1).
     init_unused: True (default) writes fan-out pointer = 0 (count 0) for every
         neuron that holds no network neuron (spare neurons of used cores and all
         neurons of unused cores) and learn_en = 0 on unused cores, so that
@@ -383,6 +385,7 @@ def compile_net(net: NetIR, mesh_x: int, mesh_y: int, n_neurons: int = 256, n_ax
         cw(F.addr_reg(REG_PLASTIC_AXON_MAX), 0)
         cw(F.addr_reg(REG_TH_INC), 0)
         cw(F.addr_reg(REG_TH_DECAY), 0)
+        cw(F.addr_reg(22), 0)  # AUDIT-1 L4: region-00 accesses go to weights, not eligibility
         # fan-out entry list for this layer (same for every neuron)
         if s.layer == n_layers - 1:
             dests = [(HOST_X, 0, None)]

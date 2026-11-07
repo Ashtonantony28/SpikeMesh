@@ -36,12 +36,12 @@ New tests: `tests/core/test_core.py::test_learn_traces_reset` (3 configs) and `t
 | M2 | medium | open | `rtl/core/learn_engine.sv` `u_elig`; SPEC §5 | R-STDP eligibility memory is never reset, and the SPEC does not say what it holds after reset |
 | M3 | medium | open | `learn/stdp_unsupervised.py:14-17`; `rtl/core/neurocore.sv:35` | Direct inhibition breaks the SPEC §2 one-spike-per-axon rule; the RTL accumulator can wrap where golden saturates |
 | M4 | medium | open (known) | `rtl/core/neurocore.sv:660-663` | Every spike sweeps all `N_NEURONS` |
-| M5 | medium | open | `Makefile:3` | `make test` skips `tests/fpga` and `tests/learn` |
+| M5 | medium | fixed (lead) | `Makefile:3` | `make test` skips `tests/fpga` and `tests/learn` |
 | M6 | medium | open (known) | `fpga/vivado/*`, `fpga/vivado/README.md` | Vivado never run; the Yosys resource table has no report in the repo |
 | L1 | low | open (known) | `formal/run.sh` | Router FIFO_DEPTH 4 not proven; whole-system quiescence not formally composed |
 | L2 | low | open (known) | `learn/README.md` | Unsupervised STDP reaches 60.4 %, below the 85 % target; some ceiling claims have no artifact |
 | L3 | low | open | `host/fpga_backend.py` `soft_reset` | After SOFT_RESET the chip runs the old program with default registers |
-| L4 | low | open | `compiler/compile.py:376-385` | Compiler does not write reg 22 (`dbg_elig`) |
+| L4 | low | fixed (lead, reg 22 = 0 now written) | `compiler/compile.py:376-385` | Compiler does not write reg 22 (`dbg_elig`) |
 | L5 | low | open | `fpga/rtl/uart_bridge.sv`, `flit_link.sv` | A UART-only host cannot see UART overflow or framing errors |
 | L6 | low | open | `docs/adr/`, `README.md` | ADRs cited by the SPEC are missing; the top README says "under construction" |
 
