@@ -1,4 +1,6 @@
-# SpikeMesh architecture specification (v0.1)
+# SpikeMesh architecture specification (v0.2)
+
+v0.2 (2026-11-07) changes, all from the on-chip learning experiments (`learn/README.md`): trace decay floor, rounded reward, non-plastic axons, adaptive threshold, rewards dropped while R-STDP is off. See §9.
 
 This document is the single contract shared by the PyTorch trainer (`train/`), the integer golden model (`golden/`), the compiler (`compiler/`) and the RTL (`rtl/`). If any of them disagrees with this file, that component is wrong. Changes to this file need an ADR in `docs/adr/`.
 
@@ -170,3 +172,14 @@ The core accepts SPIKE, CFG_WRITE, READ_REQ and CTRL flits. During UPDATE it mus
 | `t_parity` | out | Current p |
 
 Tick controller sequence on `step`: wait for quiescence (§3) → pulse `learn_start` → wait until no core is busy → pulse `update_start` → wait until no core is busy → pulse `step_done`, flip parity. Spikes emitted during UPDATE may still be in flight at `step_done`; the next STEP's quiesce phase absorbs them.
+
+
+## 9. v0.2 learning changes (ADR-007)
+
+These override the matching text in §2, §5 and §6.
+
+1. **Decay floor.** Every shift decay in §6 (`x_pre`, `x_post`) and the adaptive threshold below uses `x -= max(1, x >> k)` when `x > 0` and `k > 0` (so a trace reaches 0). Eligibility decay (signed) is unchanged: `e -= e >>> tau_elig_shift`.
+2. **Rounded reward.** R-STDP weight change is `(r * e + (1 << (reward_shift - 1))) >>> reward_shift` when `reward_shift > 0`, else `r * e`.
+3. **Non-plastic axons.** Core register 23 `plastic_axon_max` (uint16, reset 0). When non-zero, axons `a >= plastic_axon_max` are fixed: their `pre_flag` is never set (no depression row), and in potentiation they are still visited and `sr()` is still drawn (LFSR order unchanged) but their weight (or eligibility) is not written. Their `x_pre` trace still updates.
+4. **Adaptive threshold.** Per-neuron `theta_a[n]` (uint16, reset value undefined like other neuron memories; the host writes it). Core registers 24 `th_inc` (uint16, reset 0) and 25 `th_decay_shift` (uint4, reset 0). In UPDATE (§2) the comparison and subtract-reset use `theta_eff = min(32767, theta + theta_a[n])`. After the spike decision, for every neuron (including refractory ones): first decay `theta_a` per rule 1 with `th_decay_shift`, then if the neuron spiked, `theta_a = min(65535, theta_a + th_inc)`. This works whether or not `learn_en` is set. Readback / write: region 11 debug space 6, index n.
+5. **Rewards while off.** A CTRL REWARD that arrives while `learn_en = 0` or `rstdp_en = 0` is dropped.
