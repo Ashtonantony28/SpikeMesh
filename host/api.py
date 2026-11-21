@@ -80,9 +80,11 @@ class GoldenBackend(Backend):
                 self._core(d).receive_reward(d["reward"])
 
     def step(self):
+        # SPEC §3: a spike emitted by UPDATE(t) is tagged with parity p ^ 1 (integrated at t+1);
+        # host-bound spikes carry the same tag as the RTL core (tests/core/core_model.py).
         p = self.chip.t & 1
         for (sx, sy, n) in self.chip.step():
-            self._out.append(F.host_spike(sx, sy, n, p))
+            self._out.append(F.host_spike(sx, sy, n, p ^ 1))
 
     def recv_flits(self):
         out, self._out = self._out, []
