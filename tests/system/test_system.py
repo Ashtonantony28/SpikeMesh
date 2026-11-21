@@ -47,10 +47,25 @@ def _random_case(seed, sparse_ok=True):
     return rng, net, prog
 
 
+def _record_recv(be):
+    """Wrap be.recv_flits so every batch of chip -> host flits is kept, raw."""
+    log, inner = [], be.recv_flits
+
+    def recv():
+        got = inner()
+        log.append(sorted(int(f) for f in got))
+        return got
+    be.recv_flits = recv
+    return log
+
+
 def _compare_samples(prog, net, be, rng, n_samples=2, T=30):
-    """Run n_samples (state reset in between) on RTL and golden; compare."""
+    """Run n_samples (state reset in between) on RTL and golden; compare decoded rasters and the
+    raw host-bound flits (every field, including the parity tag), batch by batch as a multiset."""
+    gb = GoldenBackend.for_program(prog)
+    log_r, log_g = _record_recv(be), _record_recv(gb)
     hr = SpikeMeshHost(be)
-    hg = SpikeMeshHost(GoldenBackend.for_program(prog))
+    hg = SpikeMeshHost(gb)
     hr.load(prog)
     hg.load(prog)
     total = 0
@@ -69,6 +84,9 @@ def _compare_samples(prog, net, be, rng, n_samples=2, T=30):
             assert_same(ras_r[L], ras_g[L], f"sample {s} layer {L} raster (RTL vs golden)")
             assert_same(ras_r[L], ref[L], f"sample {s} layer {L} raster (RTL vs reference_run)")
             total += int(ras_r[L].sum())
+    assert len(log_r) == len(log_g)
+    for i, (r, g) in enumerate(zip(log_r, log_g)):
+        assert r == g, f"recv batch {i}: RTL host flits differ from golden (raw)"
     assert be.err == 0 and be.drop_cnt == 0
     return total
 
