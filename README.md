@@ -19,6 +19,16 @@ A digital neuromorphic processor in SystemVerilog. Leaky integrate-and-fire neur
 | KV260 resources (Yosys estimate, 4×4 mesh, UltraRAM weights) | 47% LUTs, 33% BRAM, 50% URAM | `fpga/vivado/README.md` |
 | Formal | router safety properties proven by induction (FIFO depth 2); tick controller proven | `formal/run.sh`, `rtl/noc/README.md` |
 
+## Gallery
+
+![The trained SNN classifying emulated N-MNIST digits on the SpikeMesh chip model](docs/media/snn-demo.gif)
+
+*The trained 256→256→10 network classifying four emulated N-MNIST test digits. Left: input events per timestep and the packets crossing the 2×2 mesh (hidden layer on core (0,0), output layer on core (1,0)). Right: hidden and output spike rasters, then the output spike vote. This is a **simulation** on the golden chip model, driven through flits by the host API. The golden chip matches the Verilator RTL chip spike for spike (`tests/system`), and the script asserts each sample against `reference_run`. Regenerate it with `python3 tools/media.py`. [MP4](docs/media/snn-demo.mp4)*
+
+![Cycles per sample against spike count](tests/system/cycles_vs_spikes.png)
+
+*RTL cost is event-driven: cycles per sample grow linearly with spike count (31.8 cycles per spike + 1,144, R² = 0.99996).*
+
 ## Layout
 
 | Dir | Contents |
